@@ -544,6 +544,27 @@ type ChatHTTPReq struct {
 	Model   string `json:"model,omitempty"`
 }
 
+func chatOutputSchemaForModel(model string) map[string]any {
+	return map[string]any{
+		"model": model,
+		"format": map[string]any{
+			"type": "text",
+		},
+	}
+}
+
+func extractionOutputSchemaInfo() map[string]any {
+	return map[string]any{
+		"model": "gpt-4.1-mini",
+		"format": map[string]any{
+			"type":   "json_schema",
+			"name":   extractionJSONSchema["name"],
+			"schema": extractionJSONSchema["schema"],
+			"strict": true,
+		},
+	}
+}
+
 type ChatHistoryHTTPResp struct {
 	SessionID      string       `json:"session_id"`
 	ConversationID string       `json:"conversation_id,omitempty"`
@@ -799,6 +820,11 @@ func main() {
 		if req.Locale == "" {
 			req.Locale = "en-IN"
 		}
+		req.Model = strings.TrimSpace(req.Model)
+		if req.Model == "" {
+			writeJSON(w, 400, map[string]any{"error": "model required: select a chat model"})
+			return
+		}
 
 		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
 		if effectiveSBURL == "" {
@@ -829,7 +855,7 @@ func main() {
 			},
 			LLM: &OpenAIClient{
 				APIKey: effectiveOAKey,
-				Model:  firstNonEmpty(strings.TrimSpace(req.Model), oaModel),
+				Model:  req.Model,
 			},
 			Tools: tools,
 			Specs: routingSpecs,
@@ -846,13 +872,15 @@ func main() {
 			return
 		}
 		writeJSON(w, 200, map[string]any{
-			"intent":           string(out.Intent),
-			"reply":            out.Reply,
-			"session_id":       sid,
-			"cookie_id":        sid,
-			"conversation_id":  out.ConversationID,
-			"chat_model":       effectiveRouter.LLM.Model,
-			"extraction_model": "gpt-4.1-mini",
+			"intent":                   string(out.Intent),
+			"reply":                    out.Reply,
+			"session_id":               sid,
+			"cookie_id":                sid,
+			"conversation_id":          out.ConversationID,
+			"chat_model":               effectiveRouter.LLM.Model,
+			"extraction_model":         "gpt-4.1-mini",
+			"chat_output_schema":       chatOutputSchemaForModel(effectiveRouter.LLM.Model),
+			"extraction_output_schema": extractionOutputSchemaInfo(),
 		})
 	})
 
