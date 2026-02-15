@@ -84,7 +84,7 @@ var extractionJSONSchema = map[string]any{
 	},
 }
 
-const extractorModelDefault = "gpt-4o-mini"
+const extractorModelDefault = "gpt-4.1-mini"
 
 type responsesCreateResponse struct {
 	ID                string `json:"id"`
@@ -422,31 +422,64 @@ func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText stri
 	if strings.TrimSpace(userText) == "" {
 		return map[string]string{}, nil
 	}
+
 	factsModel := extractorModelDefault
-	reqBody := responsesCreateRequest{
-		Model:        factsModel,
-		Instructions: "You are an information extraction engine for an ecommerce chatbot. Extract only what the user explicitly provided and return JSON matching the schema. Use null for missing values. Normalize email to lowercase. Normalize phone to digits only and preserve a leading + if provided.",
-		Input: []responsesInputMessage{{
-			Role:    "user",
-			Content: userText,
-		}},
-		Truncation:      "auto",
-		MaxOutputTokens: 140,
-		Text: map[string]any{
-			"format": map[string]any{
-				"type":   "json_schema",
-				"name":   extractionJSONSchema["name"],
-				"schema": extractionJSONSchema["schema"],
-				"strict": true,
+	buildReq := func(strict bool) responsesCreateRequest {
+		return responsesCreateRequest{
+			Model:        factsModel,
+			Instructions: "You are an information extraction engine for an ecommerce chatbot. Return ONLY JSON that matches the schema exactly. Fill every required field, including nested address_components keys. For missing values use null. intent MUST be one of the allowed enum values. confidence MUST be an integer 0-100. needs_verification MUST be true/false. Extract only user-provided facts (do not infer). Normalize email to lowercase. Normalize phone to digits-only while preserving a leading + when provided.",
+			Input: []responsesInputMessage{{
+				Role:    "user",
+				Content: userText,
+			}},
+			Truncation:      "auto",
+			MaxOutputTokens: 140,
+			Text: map[string]any{
+				"format": map[string]any{
+					"type":   "json_schema",
+					"name":   extractionJSONSchema["name"],
+					"schema": extractionJSONSchema["schema"],
+					"strict": strict,
+				},
+				"verbosity": normalizeVerbosity(factsModel, "low"),
 			},
-			"verbosity": normalizeVerbosity(factsModel, "low"),
-		},
+		}
 	}
-	reply, err := o.createResponse(reqBody)
-	if err != nil {
-		return nil, err
+
+	strictReq := buildReq(true)
+	logExtractionPayload(strictReq)
+	strictReply, strictErr := o.createResponse(strictReq)
+	if strictErr == nil {
+		return parseFactsJSON(strictReply), nil
 	}
-	return parseFactsJSON(reply), nil
+
+	log.Printf("fact extraction strict=true failed; retrying strict=false to diagnose schema rigidity: %v", strictErr)
+	relaxedReq := buildReq(false)
+	logExtractionPayload(relaxedReq)
+	relaxedReply, relaxedErr := o.createResponse(relaxedReq)
+	if relaxedErr == nil {
+		log.Printf("fact extraction succeeded with strict=false; likely schema-rigidity issue: %v", strictErr)
+		return parseFactsJSON(relaxedReply), nil
+	}
+
+	return nil, fmt.Errorf("strict extraction failed: %w | relaxed extraction failed: %v", strictErr, relaxedErr)
+}
+
+func logExtractionPayload(reqBody responsesCreateRequest) {
+	responseFormat := map[string]any{}
+	if reqBody.Text != nil {
+		if format, ok := reqBody.Text["format"]; ok {
+			if typed, ok := format.(map[string]any); ok {
+				responseFormat = typed
+			}
+		}
+	}
+	payload := map[string]any{
+		"model":           reqBody.Model,
+		"response_format": responseFormat,
+	}
+	b, _ := json.Marshal(payload)
+	log.Printf("extraction request payload: %s", string(b))
 }
 
 func normalizeVerbosity(model, requested string) string {
