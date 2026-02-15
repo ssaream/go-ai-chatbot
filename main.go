@@ -48,6 +48,37 @@ type responsesCreateRequest struct {
 	MaxOutputTokens int                     `json:"max_output_tokens,omitempty"`
 }
 
+var extractionJSONSchema = map[string]any{
+	"name": "supabase_extraction",
+	"schema": map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"app_user": map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"properties": map[string]any{
+					"name":  map[string]any{"type": "string", "maxLength": 120},
+					"email": map[string]any{"type": "string", "maxLength": 320},
+					"phone": map[string]any{"type": "string", "maxLength": 40},
+				},
+				"required": []string{"name", "email", "phone"},
+			},
+			"conversation_facts": map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"properties": map[string]any{
+					"order_id": map[string]any{"type": "string", "maxLength": 80},
+					"item":     map[string]any{"type": "string", "maxLength": 160},
+					"reason":   map[string]any{"type": "string", "maxLength": 240},
+				},
+				"required": []string{"order_id", "item", "reason"},
+			},
+		},
+		"required": []string{"app_user", "conversation_facts"},
+	},
+}
+
 type responsesCreateResponse struct {
 	ID                string `json:"id"`
 	Object            string `json:"object"`
@@ -306,7 +337,30 @@ func parseFactsJSON(raw string) map[string]string {
 	if err := json.Unmarshal([]byte(raw), &data); err != nil {
 		return out
 	}
+	if appUser, ok := data["app_user"].(map[string]any); ok {
+		for _, key := range []string{"name", "email", "phone"} {
+			if v, ok := appUser[key].(string); ok {
+				v = strings.TrimSpace(v)
+				if v != "" {
+					out[key] = v
+				}
+			}
+		}
+	}
+	if convFacts, ok := data["conversation_facts"].(map[string]any); ok {
+		for _, key := range []string{"order_id", "item", "reason"} {
+			if v, ok := convFacts[key].(string); ok {
+				v = strings.TrimSpace(v)
+				if v != "" {
+					out[key] = v
+				}
+			}
+		}
+	}
 	for _, key := range []string{"order_id", "email", "phone", "name", "item", "reason"} {
+		if _, exists := out[key]; exists {
+			continue
+		}
 		if v, ok := data[key].(string); ok {
 			v = strings.TrimSpace(v)
 			if v != "" {
@@ -325,7 +379,7 @@ func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText stri
 	factsModel := "gpt-4.1-mini"
 	reqBody := responsesCreateRequest{
 		Model:        factsModel,
-		Instructions: "Extract only fields for CRM storage. Return JSON object only with keys: order_id,email,phone,name,item,reason. Use empty string when unknown.",
+		Instructions: "Extract user + conversation facts for Supabase storage. Output JSON only, matching the provided schema. Use empty strings for unknown scalar values.",
 		Input: []responsesInputMessage{{
 			Role:    "user",
 			Content: userText,
@@ -333,7 +387,12 @@ func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText stri
 		Truncation:      "auto",
 		MaxOutputTokens: 140,
 		Text: map[string]any{
-			"format":    map[string]any{"type": "text"},
+			"format": map[string]any{
+				"type":   "json_schema",
+				"name":   extractionJSONSchema["name"],
+				"schema": extractionJSONSchema["schema"],
+				"strict": true,
+			},
 			"verbosity": normalizeVerbosity(factsModel, "low"),
 		},
 	}
@@ -483,6 +542,12 @@ type ChatHTTPReq struct {
 	Channel string `json:"channel"`
 	Locale  string `json:"locale"`
 	Model   string `json:"model,omitempty"`
+}
+
+type ChatHistoryHTTPResp struct {
+	SessionID      string       `json:"session_id"`
+	ConversationID string       `json:"conversation_id,omitempty"`
+	Messages       []MessageRow `json:"messages"`
 }
 
 type modelsListResponse struct {
@@ -643,6 +708,14 @@ func main() {
 		writeJSON(w, 200, map[string]any{"models": models})
 	})
 
+	http.HandleFunc("/extraction-schema", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"response_format": map[string]any{"type": "json_schema", "json_schema": extractionJSONSchema}})
+	})
+
 	http.HandleFunc("/new-session", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -773,12 +846,56 @@ func main() {
 			return
 		}
 		writeJSON(w, 200, map[string]any{
-			"intent":          string(out.Intent),
-			"reply":           out.Reply,
-			"session_id":      sid,
-			"cookie_id":       sid,
-			"conversation_id": out.ConversationID,
+			"intent":           string(out.Intent),
+			"reply":            out.Reply,
+			"session_id":       sid,
+			"cookie_id":        sid,
+			"conversation_id":  out.ConversationID,
+			"chat_model":       effectiveRouter.LLM.Model,
+			"extraction_model": "gpt-4.1-mini",
 		})
+	})
+
+	http.HandleFunc("/chat-history", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		sid, _, err := ensureSessionCookie(w, r)
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": "failed to establish session"})
+			return
+		}
+
+		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
+		if effectiveSBURL == "" {
+			effectiveSBURL = sbURL
+		}
+		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
+		if effectiveSBKey == "" {
+			effectiveSBKey = sbKey
+		}
+		if effectiveSBURL == "" || effectiveSBKey == "" {
+			writeJSON(w, 400, map[string]any{"error": "missing supabase configuration"})
+			return
+		}
+
+		sbc := &SupabaseClient{BaseURL: effectiveSBURL, APIKey: effectiveSBKey}
+		conv, found, err := sbc.GetOpenConversationByAnonymousID(sid)
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": err.Error()})
+			return
+		}
+		if !found {
+			writeJSON(w, 200, ChatHistoryHTTPResp{SessionID: sid, Messages: []MessageRow{}})
+			return
+		}
+		messages, err := sbc.FetchRecentMessages(conv.ID, 5)
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, ChatHistoryHTTPResp{SessionID: sid, ConversationID: conv.ID, Messages: messages})
 	})
 
 	port := getenvDefault("PORT", "8081")
