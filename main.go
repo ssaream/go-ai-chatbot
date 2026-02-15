@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -290,6 +291,58 @@ func extractTextValue(v any) string {
 	return ""
 }
 
+func parseFactsJSON(raw string) map[string]string {
+	out := map[string]string{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return out
+	}
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start >= 0 && end > start {
+		raw = raw[start : end+1]
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(raw), &data); err != nil {
+		return out
+	}
+	for _, key := range []string{"order_id", "email", "phone", "name", "item", "reason"} {
+		if v, ok := data[key].(string); ok {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				out[key] = v
+			}
+		}
+	}
+	return out
+}
+
+func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText string) (map[string]string, error) {
+	_ = ctx
+	if strings.TrimSpace(userText) == "" {
+		return map[string]string{}, nil
+	}
+	reqBody := responsesCreateRequest{
+		Model:        "gpt-4.1-mini",
+		Instructions: "Extract only fields for CRM storage. Return JSON object only with keys: order_id,email,phone,name,item,reason. Use empty string when unknown.",
+		Input: []responsesInputMessage{{
+			Role:    "user",
+			Content: userText,
+		}},
+		Truncation:      "auto",
+		MaxOutputTokens: 140,
+		Text: map[string]any{
+			"format":    map[string]any{"type": "text"},
+			"verbosity": "low",
+		},
+	}
+	reply, err := o.createResponse(reqBody)
+	if err != nil {
+		return nil, err
+	}
+	return parseFactsJSON(reply), nil
+}
+
 func extractResponseTextFallback(raw []byte) string {
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -481,7 +534,71 @@ func main() {
 			writeJSON(w, 500, map[string]any{"error": err.Error()})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"session_id": sid})
+		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
+		if effectiveSBURL == "" {
+			effectiveSBURL = sbURL
+		}
+		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
+		if effectiveSBKey == "" {
+			effectiveSBKey = sbKey
+		}
+		conversationID := ""
+		if effectiveSBURL != "" && effectiveSBKey != "" {
+			sb := &SupabaseClient{BaseURL: effectiveSBURL, APIKey: effectiveSBKey}
+			if conv, found, err := sb.GetOpenConversationByAnonymousID(sid); err == nil && found {
+				conversationID = conv.ID
+			}
+		}
+		writeJSON(w, 200, map[string]any{"session_id": sid, "conversation_id": conversationID, "cookie_id": sid})
+	})
+
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_, _, _ = ensureSessionCookie(w, r)
+		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
+		if effectiveSBURL == "" {
+			effectiveSBURL = sbURL
+		}
+		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
+		if effectiveSBKey == "" {
+			effectiveSBKey = sbKey
+		}
+		effectiveOAKey := strings.TrimSpace(r.Header.Get("X-OpenAI-Api-Key"))
+		if effectiveOAKey == "" {
+			effectiveOAKey = oaKey
+		}
+		aiConnected := false
+		aiErr := ""
+		if effectiveOAKey != "" {
+			oac := &OpenAIClient{APIKey: effectiveOAKey, Model: oaModel}
+			if _, err := oac.ListModels(); err != nil {
+				aiErr = err.Error()
+			} else {
+				aiConnected = true
+			}
+		} else {
+			aiErr = "missing OpenAI API key"
+		}
+		supabaseConnected := false
+		supabaseErr := ""
+		if effectiveSBURL != "" && effectiveSBKey != "" {
+			sbc := &SupabaseClient{BaseURL: effectiveSBURL, APIKey: effectiveSBKey}
+			if err := sbc.Ping(); err != nil {
+				supabaseErr = err.Error()
+			} else {
+				supabaseConnected = true
+			}
+		} else {
+			supabaseErr = "missing Supabase URL or service role key"
+		}
+		writeJSON(w, 200, map[string]any{
+			"backend":  map[string]any{"connected": true},
+			"ai":       map[string]any{"connected": aiConnected, "error": aiErr},
+			"supabase": map[string]any{"connected": supabaseConnected, "error": supabaseErr},
+		})
 	})
 
 	http.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
@@ -526,6 +643,36 @@ func main() {
 			Expires:  time.Now().Add(90 * 24 * time.Hour),
 		})
 		writeJSON(w, 200, map[string]any{"session_id": sid})
+	})
+
+	http.HandleFunc("/new-conversation", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		sid, _, err := ensureSessionCookie(w, r)
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": err.Error()})
+			return
+		}
+		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
+		if effectiveSBURL == "" {
+			effectiveSBURL = sbURL
+		}
+		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
+		if effectiveSBKey == "" {
+			effectiveSBKey = sbKey
+		}
+		if effectiveSBURL == "" || effectiveSBKey == "" {
+			writeJSON(w, 400, map[string]any{"error": "missing supabase configuration"})
+			return
+		}
+		sbc := &SupabaseClient{BaseURL: effectiveSBURL, APIKey: effectiveSBKey}
+		if err := sbc.CloseOpenConversationsByAnonymousID(sid); err != nil {
+			writeJSON(w, 500, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
 	})
 
 	http.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
@@ -606,8 +753,11 @@ func main() {
 			return
 		}
 		writeJSON(w, 200, map[string]any{
-			"intent": string(out.Intent),
-			"reply":  out.Reply,
+			"intent":          string(out.Intent),
+			"reply":           out.Reply,
+			"session_id":      sid,
+			"cookie_id":       sid,
+			"conversation_id": out.ConversationID,
 		})
 	})
 

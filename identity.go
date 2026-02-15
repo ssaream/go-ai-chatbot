@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -51,7 +52,7 @@ func resolveIdentity(sb *SupabaseClient, in Inbound) (AppUser, string, error) {
 		session.UserID = switchedTo
 	}
 
-	facts := (&Router{}).extractFacts(in)
+	facts := (&Router{}).extractFacts(context.Background(), in)
 	candidates := buildIdentityCandidates(facts)
 	for _, c := range candidates {
 		found, err := sb.LookupIdentityKey(c.KeyType, c.KeyValue)
