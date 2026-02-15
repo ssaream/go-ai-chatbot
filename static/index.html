@@ -1,410 +1,481 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>AI Chatbot MVP</title>
   <style>
-    body { font-family: system-ui, Arial; margin: 0; background: #f6f8fb; }
-    .layout { max-width: 1300px; margin: 10px auto; padding: 0 12px; display: grid; grid-template-columns: 2fr 1fr; gap: 12px; min-height: calc(100vh - 20px); }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; background: #fff; }
-    .chat-card { display: flex; flex-direction: column; min-height: calc(100vh - 24px); }
-    .meta { display:flex; gap:10px; flex-wrap: wrap; align-items:center; margin-bottom: 10px; color:#555; font-size: 13px; }
-    code { background: #f2f2f2; padding: 2px 6px; border-radius: 6px; }
-    .status-wrap { display:grid; grid-template-columns: repeat(3,1fr); gap:8px; margin-bottom: 10px; }
-    .status { border:1px solid #ddd; border-radius: 10px; padding:8px; font-size:12px; }
-    .ok { border-color: #17a34a; color: #146c35; background: #eefaf1; }
-    .bad { border-color: #cc3344; color: #a82331; background: #fff1f3; }
-    .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
-    .field { display: flex; flex-direction: column; gap: 6px; }
-    .field.full { grid-column: 1 / -1; }
-    .field label { font-size: 12px; color: #555; }
-    .field input, select, textarea { border: 1px solid #ddd; border-radius: 10px; padding: 10px; }
-    .hint { font-size: 12px; color: #666; margin-bottom: 10px; }
-    #chatLog { flex: 1; min-height: 260px; overflow: auto; border: 1px solid #eee; border-radius: 12px; padding: 12px; background: #fafafa; }
-    .msg { margin: 10px 0; padding: 10px 12px; border-radius: 12px; max-width: 85%; white-space: pre-wrap; }
-    .user { background: #e8f0fe; margin-left: auto; }
-    .bot  { background: #fff; border: 1px solid #eee; }
-    .row { display: flex; gap: 10px; margin-top: 12px; position: sticky; bottom: 0; background: #fff; padding-top: 8px; }
-    textarea { flex: 1; resize: vertical; min-height: 72px; max-height: 200px; }
-    button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: #111; color: #fff; cursor: pointer; }
-    button:disabled { opacity: 0.6; cursor: not-allowed; }
-    .side-log { height: calc(100vh - 120px); overflow:auto; background:#0f172a; color:#dbeafe; border-radius:10px; padding:10px; font-size:12px; }
-    .line { margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; padding: 8px; white-space: pre-wrap; }
-    .line .title { font-weight: 700; margin-bottom: 4px; }
-    .line .meta { margin: 0; color: #cbd5e1; }
-    .line pre { margin: 6px 0 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #e2e8f0; }
-    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; min-height: auto; } .chat-card { min-height: auto; } .side-log { height: 260px; } }
+    :root {
+      --bg: #f6f7fb;
+      --panel: #ffffff;
+      --border: #e5e7eb;
+      --text: #111827;
+      --muted: #6b7280;
+      --good: #16a34a;
+      --bad: #dc2626;
+      --btn: #111827;
+      --btnText: #ffffff;
+      --chip: #eef2ff;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; background: var(--bg); color: var(--text); }
+    .wrap { height: 100vh; display: grid; grid-template-columns: 1.25fr 0.75fr; gap: 12px; padding: 12px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    label { display:block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input, select, button { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 10px; font-size: 14px; outline: none; background: #fff; }
+    input:focus, select:focus { border-color: #c7d2fe; box-shadow: 0 0 0 3px rgba(99,102,241,.15); }
+    button { background: var(--btn); color: var(--btnText); border: none; cursor: pointer; font-weight: 600; }
+    button.secondary { background: #374151; }
+    button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+    .topbar { display:flex; align-items:center; justify-content: space-between; gap:10px; margin-bottom: 10px; }
+    .statusline { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .dot { display:inline-flex; align-items:center; gap:6px; padding: 6px 10px; border-radius: 999px; background: var(--chip); font-size: 12px; color: var(--muted); }
+    .dot b { color: var(--text); }
+    .dot .ok { color: var(--good); font-weight: 900; }
+    .dot .no { color: var(--bad); font-weight: 900; }
+
+    .chatArea { display: grid; grid-template-rows: auto auto 1fr auto; height: calc(100vh - 24px); min-height: 0; gap: 10px; }
+    .chatWindow { border: 1px solid var(--border); border-radius: 12px; padding: 10px; overflow-y: auto; background: #fbfbfe; min-height: 0; }
+    .msg { margin: 8px 0; display:flex; }
+    .bubble { max-width: 86%; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); background: #fff; white-space: pre-wrap; line-height: 1.35; }
+    .me { justify-content: flex-end; }
+    .me .bubble { background: #eef2ff; }
+    .sys { justify-content: center; }
+    .sys .bubble { background: #fff7ed; }
+    .composer { display: grid; grid-template-columns: 1fr 120px; gap: 10px; align-items: center; }
+    .logBox { height: calc(100vh - 24px - 48px); overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono"; font-size: 12px;
+      background: #0b1020; color: #d1d5db; border-radius: 12px; padding: 10px; white-space: pre-wrap; line-height: 1.35; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
   </style>
 </head>
 <body>
-  <div class="layout">
-    <div class="card chat-card">
-      <h2>AI Chatbot MVP</h2>
-      <div class="meta">
-        <div>Cookie ID: <code id="cookieId">...</code> <button id="newSession" type="button">New cookie/session</button></div>
-        <div>Session ID: <code id="sid">...</code></div>
-        <div>Conversation ID: <code id="conversationId">...</code> <button id="newConversation" type="button">New conversation</button></div>
-      </div>
-
-      <div class="status-wrap">
-        <div id="backendStatus" class="status bad">Backend: checking...</div>
-        <div id="aiStatus" class="status bad">AI: checking...</div>
-        <div id="supabaseStatus" class="status bad">Supabase: checking...</div>
-      </div>
-
-      <div class="config-grid">
-        <div class="field full">
-          <label for="supabaseUrl">Supabase URL</label>
-          <input id="supabaseUrl" type="text" placeholder="https://your-project.supabase.co" autocomplete="off"/>
+  <div class="wrap">
+    <div class="card chatArea">
+      <div class="topbar">
+        <div>
+          <div style="font-weight:800; font-size:16px;">Ecommerce Chatbot MVP</div>
+          <div class="hint">
+            Keys are loaded from backend local files. Chat uses selected model; extraction forced to <b>gpt-4o-mini</b>.
+          </div>
         </div>
-        <div class="field">
-          <label for="supabaseKey">Supabase Service Role Key</label>
-          <input id="supabaseKey" type="password" placeholder="service_role key" autocomplete="off"/>
-        </div>
-        <div class="field">
-          <label for="openaiKey">OpenAI API Key</label>
-          <input id="openaiKey" type="password" placeholder="sk-..." autocomplete="off"/>
-        </div>
-      </div>
-      <div class="hint">Config is saved in localStorage. Models auto-load and default to gpt-5-mini when available.</div>
-
-      <div class="field">
-        <label for="model">OpenAI Model (chat)</label>
-        <div style="display:flex; gap:8px; align-items:center;">
-          <select id="model" style="flex:1;"></select>
-          <button id="refreshModels" type="button">↻</button>
+        <div class="statusline">
+          <span class="dot"><span id="s_backend" class="no">✖</span> <b>Backend</b></span>
+          <span class="dot"><span id="s_openai" class="no">✖</span> <b>AI</b></span>
+          <span class="dot"><span id="s_supabase" class="no">✖</span> <b>Supabase</b></span>
         </div>
       </div>
 
-      <div id="chatLog"></div>
+      <div class="card" style="padding:12px; margin:0;">
+        <div class="row3">
+          <div>
+            <label>Cookie anon_id</label>
+            <input id="anonId" readonly placeholder="(auto)" />
+          </div>
+          <div>
+            <label>Session ID</label>
+            <input id="sessionId" readonly placeholder="(auto)" />
+          </div>
+          <div>
+            <label>Conversation ID</label>
+            <input id="conversationId" readonly placeholder="(auto)" />
+          </div>
+        </div>
 
-      <div class="row">
-        <textarea id="input" placeholder="Type your message... (Enter to send, Shift+Enter for newline)"></textarea>
-        <button id="send">Send</button>
+        <div class="row3" style="margin-top:10px;">
+          <div>
+            <label>Chat Model</label>
+            <select id="modelSelect"><option value="">Loading…</option></select>
+          </div>
+          <div style="display:flex; gap:10px; align-items:end;">
+            <button class="ghost" id="btnNewCookie">New Cookie</button>
+            <button class="secondary" id="btnNewSession">New Session</button>
+          </div>
+          <div style="display:flex; gap:10px; align-items:end;">
+            <button class="ghost" id="btnNewConversation">New Conversation</button>
+            <button class="ghost" id="btnReload">Reconnect</button>
+          </div>
+        </div>
+
+        <div class="hint">Reconnect order: Backend → Supabase test → Models → Resume messages.</div>
+      </div>
+
+      <div class="chatWindow" id="chatWindow"></div>
+
+      <div class="composer">
+        <input id="chatInput" placeholder="Type a message…" />
+        <button id="btnSend">Send</button>
       </div>
     </div>
 
     <div class="card">
-      <h3>Event log</h3>
-      <div id="eventLog" class="side-log"></div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <div style="font-weight:800;">Logs</div>
+        <div style="display:flex; gap:10px;">
+          <button class="ghost" id="btnCopyLogs">Copy</button>
+          <button class="ghost" id="btnClearLogs">Clear</button>
+        </div>
+      </div>
+      <div class="logBox" id="logBox"></div>
     </div>
   </div>
 
 <script>
-const STORAGE_KEYS = {
-  supabaseUrl: "chatbot.supabaseUrl",
-  supabaseKey: "chatbot.supabaseServiceRoleKey",
-  openaiKey: "chatbot.openaiApiKey",
-  model: "chatbot.openaiModel",
-};
+(() => {
+  const LS_KEY = "mvp_chat_state_v2";
+  const BACKEND = "http://localhost:8000"; // removed from UI by design
+  const ANON_COOKIE = "kandor_anon_id";
 
-const chatLog = document.getElementById("chatLog");
-const eventLog = document.getElementById("eventLog");
-const input = document.getElementById("input");
-const sendBtn = document.getElementById("send");
-const modelSel = document.getElementById("model");
-const refreshModelsBtn = document.getElementById("refreshModels");
-const sidEl = document.getElementById("sid");
-const cookieIdEl = document.getElementById("cookieId");
-const convEl = document.getElementById("conversationId");
-const newSessionBtn = document.getElementById("newSession");
-const newConversationBtn = document.getElementById("newConversation");
-const supabaseUrlInput = document.getElementById("supabaseUrl");
-const supabaseKeyInput = document.getElementById("supabaseKey");
-const openaiKeyInput = document.getElementById("openaiKey");
-const backendStatus = document.getElementById("backendStatus");
-const aiStatus = document.getElementById("aiStatus");
-const supabaseStatus = document.getElementById("supabaseStatus");
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    anonId: $("anonId"),
+    sessionId: $("sessionId"),
+    conversationId: $("conversationId"),
+    modelSelect: $("modelSelect"),
+    chatWindow: $("chatWindow"),
+    chatInput: $("chatInput"),
+    logBox: $("logBox"),
+    s_backend: $("s_backend"),
+    s_openai: $("s_openai"),
+    s_supabase: $("s_supabase"),
+  };
+  const btns = {
+    send: $("btnSend"),
+    newCookie: $("btnNewCookie"),
+    newSession: $("btnNewSession"),
+    newConversation: $("btnNewConversation"),
+    reload: $("btnReload"),
+    copyLogs: $("btnCopyLogs"),
+    clearLogs: $("btnClearLogs"),
+  };
 
-const CHAT_ROLES = new Set(["user", "assistant"]);
-
-function clearChat() {
-  chatLog.innerHTML = "";
-}
-
-function normalizeRole(role) {
-  if (role === "assistant") return "bot";
-  if (role === "user") return "user";
-  return "bot";
-}
-
-function prettyJSON(value) {
-  if (value === undefined) return "-";
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function logEvent(entry) {
-  const line = document.createElement("div");
-  line.className = "line";
-  const ts = `[${new Date().toLocaleTimeString()}]`;
-
-  if (typeof entry === "string") {
-    line.textContent = `${ts} ${entry}`;
-    eventLog.prepend(line);
-    return;
+  function log(level, msg, obj) {
+    const ts = new Date().toISOString();
+    let line = `[${ts}] ${level}: ${msg}\n`;
+    if (obj !== undefined) line += JSON.stringify(obj, null, 2) + "\n";
+    els.logBox.textContent += line + "\n";
+    els.logBox.scrollTop = els.logBox.scrollHeight;
   }
 
-  const status = entry?.status || "info";
-  const title = entry?.title || "event";
-  const inputText = prettyJSON(entry?.input);
-  const outputText = prettyJSON(entry?.output);
-  const schemaText = prettyJSON(entry?.schema);
-
-  const titleEl = document.createElement("div");
-  titleEl.className = "title";
-  titleEl.textContent = `${ts} [${status.toUpperCase()}] ${title}`;
-
-  const inputLabel = document.createElement("div");
-  inputLabel.className = "meta";
-  inputLabel.textContent = "input";
-  const inputPre = document.createElement("pre");
-  inputPre.textContent = inputText;
-
-  const outputLabel = document.createElement("div");
-  outputLabel.className = "meta";
-  outputLabel.textContent = "output";
-  const outputPre = document.createElement("pre");
-  outputPre.textContent = outputText;
-
-  const schemaLabel = document.createElement("div");
-  schemaLabel.className = "meta";
-  schemaLabel.textContent = "output schema";
-  const schemaPre = document.createElement("pre");
-  schemaPre.textContent = schemaText;
-
-  line.append(titleEl, inputLabel, inputPre, outputLabel, outputPre, schemaLabel, schemaPre);
-  eventLog.prepend(line);
-}
-
-function addMsg(text, who) {
-  const div = document.createElement("div");
-  div.className = `msg ${who}`;
-  div.textContent = text;
-  chatLog.appendChild(div);
-  chatLog.scrollTop = chatLog.scrollHeight;
-}
-
-function setStatus(el, label, ok, err = "") {
-  el.className = `status ${ok ? "ok" : "bad"}`;
-  el.textContent = err ? `${label}: ${ok ? "connected" : "error"} (${err})` : `${label}: ${ok ? "connected" : "error"}`;
-}
-
-function saveConfig() {
-  localStorage.setItem(STORAGE_KEYS.supabaseUrl, supabaseUrlInput.value.trim());
-  localStorage.setItem(STORAGE_KEYS.supabaseKey, supabaseKeyInput.value.trim());
-  localStorage.setItem(STORAGE_KEYS.openaiKey, openaiKeyInput.value.trim());
-  localStorage.setItem(STORAGE_KEYS.model, modelSel.value);
-}
-
-function loadConfig() {
-  supabaseUrlInput.value = localStorage.getItem(STORAGE_KEYS.supabaseUrl) || "";
-  supabaseKeyInput.value = localStorage.getItem(STORAGE_KEYS.supabaseKey) || "";
-  openaiKeyInput.value = localStorage.getItem(STORAGE_KEYS.openaiKey) || "";
-}
-
-function buildConfigHeaders() {
-  const headers = {};
-  if (supabaseUrlInput.value.trim()) headers["X-Supabase-Url"] = supabaseUrlInput.value.trim();
-  if (supabaseKeyInput.value.trim()) headers["X-Supabase-Service-Role-Key"] = supabaseKeyInput.value.trim();
-  if (openaiKeyInput.value.trim()) headers["X-OpenAI-Api-Key"] = openaiKeyInput.value.trim();
-  return headers;
-}
-
-async function refreshStatus() {
-  try {
-    const resp = await fetch("/status", { headers: buildConfigHeaders() });
-    const j = await resp.json();
-    setStatus(backendStatus, "Backend", !!j.backend?.connected);
-    setStatus(aiStatus, "AI", !!j.ai?.connected, j.ai?.error || "");
-    setStatus(supabaseStatus, "Supabase", !!j.supabase?.connected, j.supabase?.error || "");
-    logEvent({ status: "ok", title: "status check", input: "connectivity", output: `backend=${!!j.backend?.connected}, ai=${!!j.ai?.connected}, supabase=${!!j.supabase?.connected}` });
-  } catch (e) {
-    setStatus(backendStatus, "Backend", false, e.message);
-    setStatus(aiStatus, "AI", false, "status unavailable");
-    setStatus(supabaseStatus, "Supabase", false, "status unavailable");
-    logEvent({ status: "error", title: "status check", input: "connectivity", output: e.message });
+  function setStatus(el, ok) {
+    el.textContent = ok ? "✔" : "✖";
+    el.className = ok ? "ok" : "no";
   }
-}
 
-async function loadModels() {
-  const fallback = ["gpt-5-mini", "gpt-5", "gpt-4.1-mini", "gpt-4o-mini", "o4-mini"];
-  const saved = localStorage.getItem(STORAGE_KEYS.model) || "";
-  function setOptions(list) {
-    modelSel.innerHTML = "";
-    for (const id of list) {
-      const opt = document.createElement("option");
-      opt.value = id;
-      opt.textContent = id;
-      modelSel.appendChild(opt);
+  function addMsg(role, text) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg " + (role === "user" ? "me" : role === "system" ? "sys" : "ai");
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = text;
+    wrap.appendChild(bubble);
+    els.chatWindow.appendChild(wrap);
+    els.chatWindow.scrollTop = els.chatWindow.scrollHeight;
+  }
+
+  function clearChat() {
+    els.chatWindow.innerHTML = "";
+  }
+
+  function saveState() {
+    const st = {
+      session_id: els.sessionId.value || null,
+      conversation_id: els.conversationId.value || null,
+      model: els.modelSelect.value || null,
+    };
+    localStorage.setItem(LS_KEY, JSON.stringify(st));
+  }
+
+  function loadState() {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return;
+    try {
+      const st = JSON.parse(raw);
+      if (st.session_id) els.sessionId.value = st.session_id;
+      if (st.conversation_id) els.conversationId.value = st.conversation_id;
+    } catch {}
+  }
+
+  function clearCookie(name) {
+    document.cookie = `${name}=; Max-Age=0; path=/; samesite=lax`;
+  }
+
+  async function checkBackendHealth() {
+    const url = `${BACKEND}/health`;
+    try {
+      const r = await fetch(url, { method:"GET", credentials:"include" });
+      const ok = r.ok;
+      setStatus(els.s_backend, ok);
+      if (!ok) {
+        log("WARN", `Backend not healthy (${r.status})`);
+        return null;
+      }
+      const j = await r.json();
+      els.anonId.value = j.anon_id || "";
+      log("INFO", "Backend active (200)", j);
+      return j;
+    } catch (e) {
+      setStatus(els.s_backend, false);
+      log("WARN", "Backend not reachable.", { error: String(e) });
+      return null;
     }
-    if (saved && [...modelSel.options].some(o => o.value === saved)) {
-      modelSel.value = saved;
-    } else if ([...modelSel.options].some(o => o.value === "gpt-5-mini")) {
-      modelSel.value = "gpt-5-mini";
-    } else if (modelSel.options.length) {
-      modelSel.selectedIndex = 0;
+  }
+
+  async function testSupabase() {
+    const url = `${BACKEND}/v1/test/supabase`;
+    try {
+      log("INFO", `POST ${url}`);
+      const r = await fetch(url, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ table:"app_users", limit: 1 }),
+        credentials:"include"
+      });
+      const j = await r.json();
+      const ok = r.ok && j.ok;
+      setStatus(els.s_supabase, ok);
+      if (ok) log("INFO", "Supabase test OK.", j);
+      else log("ERROR", `Supabase test failed (${r.status})`, j);
+      return ok;
+    } catch (e) {
+      setStatus(els.s_supabase, false);
+      log("ERROR", "Supabase test failed", { error: String(e) });
+      return false;
     }
-    saveConfig();
   }
 
-  setOptions(fallback);
-  try {
-    const resp = await fetch("/models", { headers: buildConfigHeaders() });
-    const j = await resp.json();
-    if (!resp.ok) throw new Error(j.error || "failed to load models");
-    if (Array.isArray(j.models) && j.models.length) {
-      setOptions(j.models);
-      logEvent(`Loaded ${j.models.length} models`);
+  async function loadModels() {
+    const url = `${BACKEND}/v1/models`;
+    try {
+      log("INFO", `GET ${url}`);
+      const r = await fetch(url, { credentials:"include" });
+      const t = await r.text();
+      if (!r.ok) throw new Error(`Models failed (${r.status}) ${t}`);
+      const j = JSON.parse(t);
+      const models = j.models || [];
+      els.modelSelect.innerHTML = "";
+      for (const m of models) {
+        const opt = document.createElement("option");
+        opt.value = m;
+        opt.textContent = m;
+        els.modelSelect.appendChild(opt);
+      }
+      const preferred = "gpt-5-mini";
+      if (models.includes(preferred)) els.modelSelect.value = preferred;
+      else if (j.default && models.includes(j.default)) els.modelSelect.value = j.default;
+      else if (models.length) els.modelSelect.value = models[0];
+
+      setStatus(els.s_openai, true);
+      log("INFO", `Loaded ${models.length} models.`, { default_selected: els.modelSelect.value });
+      return true;
+    } catch (e) {
+      setStatus(els.s_openai, false);
+      log("ERROR", "AI model load failed", { error: String(e) });
+      return false;
     }
-  } catch (e) {
-    logEvent(`Model load fallback used: ${e.message}`);
-  }
-}
-
-async function whoAmI() {
-  const resp = await fetch("/whoami", { method: "GET", headers: buildConfigHeaders() });
-  const data = await resp.json();
-  sidEl.textContent = data.session_id || "unknown";
-  cookieIdEl.textContent = data.cookie_id || data.session_id || "unknown";
-  convEl.textContent = data.conversation_id || "none";
-}
-
-async function hydrateRecentMessages() {
-  const statusConnected = supabaseStatus.classList.contains("ok");
-  if (!statusConnected) {
-    logEvent({ status: "warn", title: "hydrate skipped", input: "supabase disconnected", output: "no history loaded" });
-    return;
   }
 
-  try {
-    const resp = await fetch("/chat-history", { method: "GET", headers: buildConfigHeaders() });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || "failed to load chat history");
+  async function createSessionIfNeeded() {
+    if (els.sessionId.value) return true;
+    const url = `${BACKEND}/v1/session`;
+    log("INFO", `POST ${url}`);
+    const r = await fetch(url, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ session_id: null, channel:"web", locale:"en" }),
+      credentials:"include"
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      log("ERROR", `Create session failed (${r.status})`, j);
+      return false;
+    }
+    els.sessionId.value = j.session_id || "";
+    els.conversationId.value = j.conversation_id || "";
+    saveState();
+    log("INFO", "Session created.", j);
+    return true;
+  }
 
-    const history = Array.isArray(data.messages) ? data.messages : [];
-    if (!history.length) {
-      logEvent({ status: "ok", title: "history hydrate", input: "last 5", output: "no previous messages" });
+  async function resumeConversation() {
+    await createSessionIfNeeded();
+    const url = `${BACKEND}/v1/conversation/latest?session_id=${encodeURIComponent(els.sessionId.value)}&limit=50`;
+    log("INFO", `GET ${url}`);
+    const r = await fetch(url, { credentials:"include" });
+    const j = await r.json();
+    if (!r.ok) {
+      log("ERROR", `Resume failed (${r.status})`, j);
+      addMsg("system", `Resume failed (${r.status}). Check logs.`);
+      return false;
+    }
+    els.anonId.value = j.anon_id || els.anonId.value;
+    els.sessionId.value = j.session_id || els.sessionId.value;
+    els.conversationId.value = j.conversation_id || els.conversationId.value;
+    saveState();
+
+    clearChat();
+    if ((j.messages || []).length === 0) {
+      addMsg("system", "No prior messages (new/empty conversation).");
+      return true;
+    }
+    addMsg("system", `Resumed conversation: ${els.conversationId.value}`);
+    for (const m of j.messages) {
+      if (!m || !m.content) continue;
+      if (m.role === "user") addMsg("user", m.content);
+      else if (m.role === "assistant") addMsg("assistant", m.content);
+    }
+    return true;
+  }
+
+  async function connectAll() {
+    // required order: Backend → Supabase → AI → Resume
+    const h = await checkBackendHealth();
+    if (!h) return;
+
+    const sbOk = await testSupabase();
+    if (!sbOk) {
+      addMsg("system", "Supabase connection failed. Fix supabase_url.txt/service_role.txt and restart backend.");
       return;
     }
 
-    clearChat();
-    for (const msg of history) {
-      if (!CHAT_ROLES.has(msg.role)) continue;
-      addMsg(msg.content || "", normalizeRole(msg.role));
+    const aiOk = await loadModels();
+    if (!aiOk) {
+      addMsg("system", "AI connection failed. Fix ai_api.txt and restart backend.");
+      return;
     }
 
-    if (data.session_id) sidEl.textContent = data.session_id;
-    if (data.conversation_id) convEl.textContent = data.conversation_id;
+    // push preferred model (optional) so backend knows default choice (no keys involved)
+    try {
+      const url = `${BACKEND}/v1/config`;
+      await fetch(url, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ preferred_model: els.modelSelect.value || "gpt-5-mini" }),
+        credentials:"include"
+      });
+    } catch {}
 
-    logEvent({ status: "ok", title: "history hydrate", input: "last 5", output: `loaded ${history.length} message(s)` });
-  } catch (e) {
-    logEvent({ status: "error", title: "history hydrate", input: "last 5", output: e.message });
+    await resumeConversation();
   }
-}
 
-async function send() {
-  const text = input.value.trim();
-  if (!text) return;
-  saveConfig();
-  addMsg(text, "user");
-  input.value = "";
-  sendBtn.disabled = true;
-
-  try {
-    const resp = await fetch("/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...buildConfigHeaders() },
-      body: JSON.stringify({ message: text, channel: "web", locale: "en-IN", model: modelSel.value })
+  async function closeAndNewConversation() {
+    if (!els.conversationId.value) {
+      // if none, just resume -> will create open conversation
+      await resumeConversation();
+      return;
+    }
+    const url = `${BACKEND}/v1/conversation/close`;
+    log("INFO", `POST ${url}`, { conversation_id: els.conversationId.value });
+    const r = await fetch(url, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ conversation_id: els.conversationId.value }),
+      credentials:"include"
     });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || "Request failed");
-    addMsg(data.reply, "bot");
-    sidEl.textContent = data.session_id || sidEl.textContent;
-    cookieIdEl.textContent = data.cookie_id || cookieIdEl.textContent;
-    convEl.textContent = data.conversation_id || convEl.textContent;
-    logEvent({
-      status: "ok",
-      title: "chat response",
-      input: {
-        user_text: text,
-        selected_chat_model: modelSel.value,
-        extracted_with_model: "gpt-4.1-mini"
-      },
-      output: {
-        reply: data.reply,
-        intent: data.intent,
-        used_chat_model: data.chat_model,
-        used_extraction_model: data.extraction_model
-      },
-      schema: {
-        chat_output_schema: data.chat_output_schema || { type: "text" },
-        extraction_output_schema: data.extraction_output_schema || null
-      }
-    });
-  } catch (e) {
-    addMsg("Error: " + e.message, "bot");
-    logEvent({ status: "error", title: "chat response", input: text, output: e.message });
-  } finally {
-    sendBtn.disabled = false;
-    input.focus();
-    await refreshStatus();
+    const j = await r.json();
+    if (!r.ok) {
+      log("ERROR", `Close failed (${r.status})`, j);
+      addMsg("system", `Close failed (${r.status}).`);
+      return;
+    }
+    addMsg("system", "Conversation closed. Starting a new one…");
+    els.conversationId.value = "";
+    saveState();
+    // this will create/open a new conversation on backend
+    els.sessionId.value = ""; // new conversation typically tied to new session in your model; simplest MVP
+    saveState();
+    await connectAll();
   }
-}
 
-sendBtn.addEventListener("click", send);
-[supabaseUrlInput, supabaseKeyInput, openaiKeyInput].forEach((el) => {
-  el.addEventListener("input", async () => {
-    saveConfig();
-    await refreshStatus();
+  async function newSession() {
+    els.sessionId.value = "";
+    els.conversationId.value = "";
+    saveState();
+    await connectAll();
+  }
+
+  async function newCookie() {
+    clearCookie(ANON_COOKIE);
+    localStorage.removeItem(LS_KEY);
+    location.reload();
+  }
+
+  async function sendChat() {
+    const text = (els.chatInput.value || "").trim();
+    if (!text) return;
+
+    if (!els.sessionId.value || !els.conversationId.value) {
+      await connectAll();
+      if (!els.sessionId.value || !els.conversationId.value) return;
+    }
+
+    const url = `${BACKEND}/v1/chat`;
+    const payload = {
+      session_id: els.sessionId.value,
+      conversation_id: els.conversationId.value,
+      model: els.modelSelect.value || "gpt-5-mini",
+      message: text
+    };
+
+    addMsg("user", text);
+    els.chatInput.value = "";
+    log("INFO", `POST ${url}`, payload);
+
+    const r = await fetch(url, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify(payload),
+      credentials:"include"
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      log("ERROR", `Chat failed (${r.status})`, j);
+      addMsg("system", `Error: ${r.status}`);
+      return;
+    }
+    els.conversationId.value = j.conversation_id || els.conversationId.value;
+    saveState();
+    addMsg("assistant", j.reply || "(no reply)");
+    log("INFO", "Chat success.", { chat_model: j.chat_model, extractor_model: j.extractor_model, extracted: j.extracted });
+  }
+
+  // Events
+  btns.reload.addEventListener("click", connectAll);
+  btns.newSession.addEventListener("click", newSession);
+  btns.newConversation.addEventListener("click", closeAndNewConversation);
+  btns.newCookie.addEventListener("click", newCookie);
+
+  btns.send.addEventListener("click", sendChat);
+  els.chatInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+
+  els.modelSelect.addEventListener("change", async () => {
+    saveState();
+    try {
+      const url = `${BACKEND}/v1/config`;
+      await fetch(url, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ preferred_model: els.modelSelect.value || "gpt-5-mini" }),
+        credentials:"include"
+      });
+      log("INFO", "Preferred model updated.", { preferred_model: els.modelSelect.value });
+    } catch (e) {
+      log("WARN", "Failed updating preferred model.", { error: String(e) });
+    }
   });
-});
-modelSel.addEventListener("change", () => { saveConfig(); logEvent({ status: "info", title: "model selected", input: "dropdown", output: modelSel.value }); });
-refreshModelsBtn.addEventListener("click", async () => { await loadModels(); });
 
-input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    send();
-  }
-});
+  btns.copyLogs.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(els.logBox.textContent); log("INFO", "Copied logs to clipboard."); }
+    catch (e) { log("ERROR", "Copy failed", { error: String(e) }); }
+  });
+  btns.clearLogs.addEventListener("click", () => { els.logBox.textContent = ""; });
 
-newSessionBtn.addEventListener("click", async () => {
-  await fetch("/new-session", { method: "POST" });
-  chatLog.innerHTML = "";
-  addMsg("New cookie/session started.", "bot");
-  logEvent("Started new session");
-  await whoAmI();
-});
-
-newConversationBtn.addEventListener("click", async () => {
-  const resp = await fetch("/new-conversation", { method: "POST", headers: buildConfigHeaders() });
-  const data = await resp.json();
-  if (!resp.ok) {
-    logEvent(`Failed to start new conversation: ${data.error || 'unknown error'}`);
-    return;
-  }
-  chatLog.innerHTML = "";
-  addMsg("Started a new conversation thread.", "bot");
-  logEvent("Started new conversation");
-  await whoAmI();
-});
-
-(async function init() {
-  loadConfig();
-  await refreshStatus();
-  await loadModels();
-  await whoAmI();
-  await hydrateRecentMessages();
-  if (!chatLog.childElementCount) {
-    addMsg("Hi! I can help with orders, returns, and product questions.", "bot");
-  }
-  logEvent({ status: "ok", title: "ui initialized", input: "startup", output: "ready" });
+  // Boot
+  (async function boot() {
+    loadState();
+    await connectAll();
+  })();
 })();
 </script>
 </body>

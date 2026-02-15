@@ -2,55 +2,389 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-const sessionCookieName = "sid"
+const (
+	anonCookie       = "kandor_anon_id"
+	anonCookieMaxAge = 60 * 60 * 24 * 365
+)
 
-type OpenAIClient struct {
-	APIKey string
-	Model  string
+var extractorModel = getenv("EXTRACTOR_MODEL", "gpt-4o-mini")
+
+var uiOrigins = splitCSV(getenv("UI_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000,file://"))
+
+type RuntimeConfig struct {
+	SupabaseURL         string `json:"supabase_url,omitempty"`
+	SupabaseServiceRole string `json:"supabase_service_role,omitempty"`
+	OpenAIAPIKey        string `json:"openai_api_key,omitempty"`
+	PreferredModel      string `json:"preferred_model,omitempty"`
 }
 
-// Keep this type exactly as-is since router.go already uses it.
-type openAIChatMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+var (
+	cfgMu sync.RWMutex
+	cfg   = RuntimeConfig{PreferredModel: "gpt-5-mini"}
+)
+
+type SessionIn struct {
+	SessionID string         `json:"session_id"`
+	Channel   string         `json:"channel"`
+	Locale    string         `json:"locale"`
+	Metadata  map[string]any `json:"metadata"`
 }
 
-/*
-Responses API request/response structs
-Docs: POST /v1/responses
-*/
-type responsesInputMessage struct {
-	Role    string `json:"role"`    // "developer" | "system" | "user" | "assistant"
-	Content string `json:"content"` // plain text
+type ChatIn struct {
+	SessionID      string `json:"session_id"`
+	ConversationID string `json:"conversation_id"`
+	Message        string `json:"message"`
+	Model          string `json:"model"`
 }
 
-type responsesCreateRequest struct {
-	Model           string                  `json:"model"`
-	Input           []responsesInputMessage `json:"input,omitempty"`
-	Instructions    string                  `json:"instructions,omitempty"`
-	Truncation      string                  `json:"truncation,omitempty"` // "auto"
-	Text            map[string]any          `json:"text,omitempty"`
-	MaxOutputTokens int                     `json:"max_output_tokens,omitempty"`
+type ConfigIn struct {
+	PreferredModel string `json:"preferred_model"`
 }
 
-var extractionJSONSchema = map[string]any{
-	"name": "extracted_fields",
-	"schema": map[string]any{
+type TestSupabaseIn struct {
+	Table  string `json:"table"`
+	Limit  int    `json:"limit"`
+	Select string `json:"select"`
+}
+
+type CloseConversationIn struct {
+	ConversationID string `json:"conversation_id"`
+}
+
+func main() {
+	loadSecretsFromFiles()
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.Dir("static")))
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/v1/config", configHandler)
+	mux.HandleFunc("/v1/models", modelsHandler)
+	mux.HandleFunc("/v1/test/supabase", testSupabaseHandler)
+	mux.HandleFunc("/v1/session", sessionHandler)
+	mux.HandleFunc("/v1/conversation/latest", latestConversationHandler)
+	mux.HandleFunc("/v1/conversation/close", closeConversationHandler)
+	mux.HandleFunc("/v1/chat", chatHandler)
+
+	h := corsMiddleware(mux)
+	log.Println("Listening on :8000")
+	log.Fatal(http.ListenAndServe(":8000", h))
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	anon := getOrSetAnonID(w, r)
+	writeJSON(w, 200, map[string]any{"ok": true, "anon_id": anon})
+}
+
+func configHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	var in ConfigIn
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if strings.TrimSpace(in.PreferredModel) != "" {
+		cfgMu.Lock()
+		cfg.PreferredModel = strings.TrimSpace(in.PreferredModel)
+		cfgMu.Unlock()
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "config": maskConfig(getConfig())})
+}
+
+func modelsHandler(w http.ResponseWriter, r *http.Request) {
+	key, err := requireOpenAIKey()
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"detail": err.Error()})
+		return
+	}
+	req, _ := http.NewRequest(http.MethodGet, "https://api.openai.com/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	client := &http.Client{Timeout: 25 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeJSON(w, 502, map[string]any{"detail": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		writeJSON(w, 502, map[string]any{"openai_status": resp.StatusCode, "body": string(body)})
+		return
+	}
+	var parsed map[string]any
+	_ = json.Unmarshal(body, &parsed)
+	ids := []string{}
+	if arr, ok := parsed["data"].([]any); ok {
+		for _, v := range arr {
+			if m, ok := v.(map[string]any); ok {
+				if id, ok := m["id"].(string); ok {
+					ids = append(ids, id)
+				}
+			}
+		}
+	}
+	sort.Strings(ids)
+	writeJSON(w, 200, map[string]any{"models": ids, "default": "gpt-5-mini"})
+}
+
+func testSupabaseHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	var in TestSupabaseIn
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		in = TestSupabaseIn{Table: "app_users", Limit: 1, Select: "*"}
+	}
+	if in.Table == "" {
+		in.Table = "app_users"
+	}
+	if in.Limit <= 0 || in.Limit > 50 {
+		in.Limit = 1
+	}
+	if in.Select == "" {
+		in.Select = "*"
+	}
+	base, key, err := requireSupabase()
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"detail": err.Error()})
+		return
+	}
+	u := fmt.Sprintf("%s/rest/v1/%s", strings.TrimRight(base, "/"), strings.TrimLeft(in.Table, "/"))
+	q := url.Values{"select": []string{in.Select}, "limit": []string{strconv.Itoa(in.Limit)}}
+	req, _ := http.NewRequest(http.MethodGet, u+"?"+q.Encode(), nil)
+	addSBHeaders(req, key, "")
+	res, body, err := doReq(req, 25*time.Second)
+	if err != nil {
+		writeJSON(w, 502, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if res.StatusCode >= 400 {
+		writeJSON(w, 200, map[string]any{"ok": false, "supabase_status": res.StatusCode, "body": string(body)})
+		return
+	}
+	var rows []any
+	_ = json.Unmarshal(body, &rows)
+	writeJSON(w, 200, map[string]any{"ok": true, "rows_count": len(rows)})
+}
+
+func sessionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	anon := getOrSetAnonID(w, r)
+	var in SessionIn
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if in.SessionID == "" {
+		in.SessionID = newUUID()
+	}
+	if in.Channel == "" {
+		in.Channel = "web"
+	}
+	if in.Locale == "" {
+		in.Locale = "en"
+	}
+	if in.Metadata == nil {
+		in.Metadata = map[string]any{}
+	}
+	client := &http.Client{Timeout: 90 * time.Second}
+	user, err := ensureAppUserForAnon(client, anon)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	userID := asString(user["id"])
+	_ = ensureUserSession(client, in.SessionID, userID, in.Channel, merge(map[string]any{"anon_id": anon}, in.Metadata))
+	conversationID, err := ensureOpenConversation(client, userID, in.SessionID, in.Channel, in.Locale, merge(map[string]any{"anon_id": anon}, in.Metadata))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	_ = sbInsertEvent(client, userID, conversationID, "session_created", "backend", map[string]any{"anon_id": anon, "session_id": in.SessionID})
+	writeJSON(w, 200, map[string]any{"anon_id": anon, "session_id": in.SessionID, "user_id": userID, "conversation_id": conversationID})
+}
+
+func latestConversationHandler(w http.ResponseWriter, r *http.Request) {
+	anon := getOrSetAnonID(w, r)
+	sessionID := r.URL.Query().Get("session_id")
+	if sessionID == "" {
+		sessionID = newUUID()
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 50
+	}
+	client := &http.Client{Timeout: 90 * time.Second}
+	user, err := ensureAppUserForAnon(client, anon)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	userID := asString(user["id"])
+	_ = ensureUserSession(client, sessionID, userID, "web", map[string]any{"anon_id": anon})
+	convID, _ := getLatestOpenConversationID(client, userID)
+	if convID == "" {
+		convID, err = ensureOpenConversation(client, userID, sessionID, "web", "en", map[string]any{"anon_id": anon})
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
+	msgs, _ := loadConversationMessages(client, convID, limit)
+	_ = sbInsertEvent(client, userID, convID, "conversation_resumed", "backend", map[string]any{"anon_id": anon, "session_id": sessionID, "limit": limit})
+	writeJSON(w, 200, map[string]any{"ok": true, "anon_id": anon, "session_id": sessionID, "conversation_id": convID, "messages": msgs})
+}
+
+func closeConversationHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	anon := getOrSetAnonID(w, r)
+	var in CloseConversationIn
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	client := &http.Client{Timeout: 60 * time.Second}
+	user, err := ensureAppUserForAnon(client, anon)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	userID := asString(user["id"])
+	res, err := sbGet(client, "conversations", map[string]string{"select": "id,user_id,status", "id": "eq." + in.ConversationID, "limit": "1"})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	rows := toSliceMap(res)
+	if len(rows) == 0 || asString(rows[0]["user_id"]) != userID {
+		writeJSON(w, 404, map[string]any{"detail": "Conversation not found for this user."})
+		return
+	}
+	_, _ = sbPatch(client, "conversations", map[string]any{"status": "closed", "updated_at": isoNow()}, map[string]string{"id": "eq." + in.ConversationID}, "return=minimal")
+	_ = sbInsertEvent(client, userID, in.ConversationID, "conversation_closed", "backend", map[string]any{"anon_id": anon})
+	writeJSON(w, 200, map[string]any{"ok": true, "conversation_id": in.ConversationID, "status": "closed"})
+}
+
+func chatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	var in ChatIn
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	if strings.TrimSpace(in.Message) == "" {
+		writeJSON(w, 400, map[string]any{"detail": "Message is empty."})
+		return
+	}
+	key, err := requireOpenAIKey()
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"detail": err.Error()})
+		return
+	}
+	selectedModel := in.Model
+	if selectedModel == "" {
+		selectedModel = getConfig().PreferredModel
+	}
+	if selectedModel == "" {
+		selectedModel = "gpt-5-mini"
+	}
+	anon := getOrSetAnonID(w, r)
+	if in.SessionID == "" {
+		in.SessionID = newUUID()
+	}
+	client := &http.Client{Timeout: 90 * time.Second}
+	user, err := ensureAppUserForAnon(client, anon)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	userID := asString(user["id"])
+	_ = ensureUserSession(client, in.SessionID, userID, "web", map[string]any{"anon_id": anon})
+	convID := in.ConversationID
+	if convID == "" {
+		convID, err = ensureOpenConversation(client, userID, in.SessionID, "web", "en", map[string]any{"anon_id": anon})
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
+
+	t0 := time.Now()
+	extracted, extErr := aiExtractFields(client, key, in.Message)
+	if extracted == nil {
+		extracted = extractorFallback()
+	}
+	_ = sbInsertToolCall(client, convID, "ai_extractor", ternary(extErr == nil, "success", "error"), map[string]any{"model": extractorModel}, map[string]any{"latency_ms": int(time.Since(t0).Milliseconds()), "extracted": extracted, "error": errToAny(extErr)})
+	_ = applyExtractedFields(client, userID, extracted)
+
+	historyResp, _ := sbGet(client, "messages", map[string]string{"select": "role,content,created_at", "conversation_id": "eq." + convID, "order": "created_at.desc", "limit": "20"})
+	rows := toSliceMap(historyResp)
+	reverse(rows)
+	system := "You are a helpful ecommerce assistant.\nCRITICAL: Ask AT MOST ONE question per reply.\nMVP LIMITATION: You are not connected to the real order system yet. Do NOT claim you can look up orders.\nYou can collect email/phone/order id and offer to route to support.\nNever ask for card/payment details.\n"
+	msgs := []map[string]any{{"role": "system", "content": system}}
+	for _, row := range rows {
+		role, content := asString(row["role"]), asString(row["content"])
+		if (role == "user" || role == "assistant" || role == "system") && strings.TrimSpace(content) != "" {
+			msgs = append(msgs, map[string]any{"role": role, "content": content})
+		}
+	}
+	msgs = append(msgs, map[string]any{"role": "user", "content": in.Message})
+
+	resp, err := openAIResponses(client, key, map[string]any{"model": selectedModel, "input": msgs, "text": map[string]any{"format": map[string]any{"type": "text"}}}, 60*time.Second)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	reply := strings.TrimSpace(responsesText(resp))
+	if reply == "" {
+		reply = "(No text returned.)"
+	}
+
+	_, _ = sbPost(client, "messages", map[string]any{"conversation_id": convID, "role": "user", "content": in.Message, "payload": map[string]any{"session_id": in.SessionID, "anon_id": anon, "ts": isoNow()}}, nil, "return=minimal")
+	_, _ = sbPost(client, "messages", map[string]any{"conversation_id": convID, "role": "assistant", "content": reply, "payload": map[string]any{"model_used": selectedModel, "session_id": in.SessionID, "anon_id": anon, "ts": isoNow()}}, nil, "return=minimal")
+	_, _ = sbPatch(client, "conversations", map[string]any{"updated_at": isoNow()}, map[string]string{"id": "eq." + convID}, "return=minimal")
+	_ = sbInsertEvent(client, userID, convID, "chat_turn", "backend", map[string]any{"anon_id": anon, "session_id": in.SessionID, "model": selectedModel})
+
+	writeJSON(w, 200, map[string]any{"anon_id": anon, "session_id": in.SessionID, "conversation_id": convID, "reply": reply, "chat_model": selectedModel, "extracted": extracted, "extractor_model": extractorModel, "extractor_error": errToAny(extErr)})
+}
+
+func aiExtractFields(client *http.Client, key, userText string) (map[string]any, error) {
+	sys := "You are an information extraction engine for an ecommerce chatbot.\nExtract ONLY what the user explicitly provided. If missing, output null.\nNormalization:\n- email: lowercase\n- phone: digits only, keep leading + if present\nOrder ID must be explicit (e.g., 'order 12345', '#12345'). Otherwise null.\nAddress must be explicitly provided. Otherwise null.\nReturn JSON only that matches the schema. Do not add extra keys.\n"
+	payload := map[string]any{"model": extractorModel, "input": []map[string]any{{"role": "system", "content": sys}, {"role": "user", "content": userText}}, "temperature": 0, "text": map[string]any{"format": map[string]any{"type": "json_schema", "name": "extracted_fields", "schema": extractionSchema()}}}
+	resp, err := openAIResponses(client, key, payload, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	ex := responsesFirstJSON(resp)
+	if ex == nil {
+		return nil, errors.New("extractor failed: no json parsed")
+	}
+	if v, ok := ex["email"].(string); ok && strings.TrimSpace(v) != "" {
+		ex["email"] = normalizeEmail(v)
+	}
+	if v, ok := ex["phone"].(string); ok && strings.TrimSpace(v) != "" {
+		ex["phone"] = normalizePhone(v)
+	}
+	return ex, nil
+}
+
+func extractionSchema() map[string]any {
+	return map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
 		"properties": map[string]any{
@@ -81,933 +415,525 @@ var extractionJSONSchema = map[string]any{
 			"notes":              map[string]any{"type": []any{"string", "null"}},
 		},
 		"required": []string{"name", "email", "phone", "order_id", "address", "address_components", "intent", "confidence", "needs_verification", "notes"},
-	},
+	}
 }
 
-const extractorModelDefault = "gpt-4.1-mini"
-
-type responsesCreateResponse struct {
-	ID                string `json:"id"`
-	Object            string `json:"object"`
-	Status            string `json:"status"`
-	IncompleteDetails *struct {
-		Reason string `json:"reason"`
-	} `json:"incomplete_details"`
-	// Some SDK/examples expose a convenience concatenation field.
-	OutputText string `json:"output_text"`
-
-	Error *struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-
-	Output []struct {
-		Type    string `json:"type"` // "message"
-		Role    string `json:"role"` // "assistant"
-		Text    any    `json:"text"`
-		Refusal any    `json:"refusal"`
-		Content []struct {
-			Type    string `json:"type"` // "output_text" | "refusal"
-			Text    any    `json:"text"`
-			Refusal any    `json:"refusal"`
-		} `json:"content"`
-	} `json:"output"`
+func applyExtractedFields(client *http.Client, userID string, extracted map[string]any) error {
+	patch := map[string]any{"last_seen_at": isoNow()}
+	hasAny := false
+	if v := asString(extracted["name"]); v != "" {
+		patch["name"] = strings.TrimSpace(v)
+		hasAny = true
+	}
+	if v := asString(extracted["email"]); v != "" {
+		patch["email"] = normalizeEmail(v)
+		hasAny = true
+	}
+	if v := asString(extracted["phone"]); v != "" {
+		patch["phone"] = normalizePhone(v)
+		hasAny = true
+	}
+	if hasAny {
+		conf := toInt(extracted["confidence"])
+		if conf < 60 {
+			conf = 60
+		}
+		patch["identity_status"] = "identified"
+		patch["identity_tier"] = 1
+		patch["confidence_score"] = conf
+		if asString(extracted["email"]) != "" {
+			patch["primary_identifier"] = asString(extracted["email"])
+		} else if asString(extracted["phone"]) != "" {
+			patch["primary_identifier"] = asString(extracted["phone"])
+		} else {
+			patch["primary_identifier"] = asString(extracted["name"])
+		}
+	}
+	res, err := sbPatch(client, "app_users", patch, map[string]string{"id": "eq." + userID}, "return=minimal")
+	if err != nil {
+		return err
+	}
+	if res.StatusCode >= 400 {
+		return fmt.Errorf("app_users patch failed: %d", res.StatusCode)
+	}
+	if v := asString(extracted["email"]); v != "" {
+		_ = upsertIdentityKey(client, userID, "email", normalizeEmail(v), false)
+	}
+	if v := asString(extracted["phone"]); v != "" {
+		_ = upsertIdentityKey(client, userID, "phone", normalizePhone(v), false)
+	}
+	return nil
 }
 
-// Chat keeps the SAME signature your router.go currently calls.
-// Internally it uses the Responses API now.
-func (o *OpenAIClient) Chat(system string, summary string, history []openAIChatMsg, userText string) (string, error) {
-	model := strings.TrimSpace(o.Model)
-	if model == "" {
-		model = "gpt-5-mini"
+func upsertIdentityKey(client *http.Client, userID, keyType, keyValue string, verified bool) error {
+	payload := map[string]any{"user_id": userID, "key_type": keyType, "key_value": keyValue, "verified": verified, "first_seen_at": isoNow(), "last_seen_at": isoNow(), "metadata": map[string]any{"source": "ai_extractor"}}
+	res, err := sbPost(client, "identity_keys", payload, map[string]string{"on_conflict": "user_id,key_type,key_value"}, "return=minimal,resolution=merge-duplicates")
+	if err == nil && (res.StatusCode == 200 || res.StatusCode == 201 || res.StatusCode == 204) {
+		return nil
 	}
-	maxOutputTokens := getenvIntDefault("OPENAI_MAX_OUTPUT_TOKENS", 180)
-	verbosity := normalizeVerbosity(model, getenvDefault("OPENAI_VERBOSITY", "low"))
+	_, _ = sbPost(client, "identity_keys", payload, nil, "return=minimal")
+	return nil
+}
 
-	// Build Responses input messages (simple role+string content per docs)
-	input := make([]responsesInputMessage, 0, 2+len(history)+1)
-
-	// Put app instructions into `instructions` (preferred)
-	instructions := strings.TrimSpace(system)
-
-	// Add summary (if any) as additional developer context
-	if strings.TrimSpace(summary) != "" {
-		input = append(input, responsesInputMessage{
-			Role:    "developer",
-			Content: "Conversation summary: " + summary,
-		})
+func ensureAppUserForAnon(client *http.Client, anonID string) (map[string]any, error) {
+	payload := map[string]any{"anonymous_id": anonID, "identity_status": "anonymous", "identity_tier": 0, "confidence_score": 30, "primary_identifier": anonID, "last_seen_at": isoNow(), "profile": map[string]any{}, "external_ids": map[string]any{}}
+	res, err := sbPost(client, "app_users", payload, map[string]string{"on_conflict": "anonymous_id"}, "return=representation,resolution=merge-duplicates")
+	if err != nil {
+		return nil, err
 	}
+	if res.StatusCode >= 400 {
+		return nil, fmt.Errorf("app_users upsert failed: %d", res.StatusCode)
+	}
+	rows := toSliceMap(res)
+	if len(rows) > 0 {
+		return rows[0], nil
+	}
+	g, err := sbGet(client, "app_users", map[string]string{"select": "*", "anonymous_id": "eq." + anonID, "limit": "1"})
+	if err != nil {
+		return nil, err
+	}
+	rows2 := toSliceMap(g)
+	if len(rows2) == 0 {
+		return nil, errors.New("app_users not found after upsert")
+	}
+	return rows2[0], nil
+}
 
-	// Add prior chat history
-	for _, m := range history {
-		role := m.Role
-		switch role {
-		case "user", "assistant", "system", "developer":
-			// ok
-		default:
-			role = "user"
+func ensureUserSession(client *http.Client, sessionID, userID, channel string, metadata map[string]any) error {
+	ins, err := sbPost(client, "user_sessions", map[string]any{"session_id": sessionID, "user_id": userID, "channel": channel, "created_at": isoNow(), "last_seen_at": isoNow(), "metadata": metadata}, nil, "return=minimal")
+	if err != nil {
+		return err
+	}
+	if ins.StatusCode == 409 {
+		upd, err := sbPatch(client, "user_sessions", map[string]any{"last_seen_at": isoNow(), "metadata": metadata}, map[string]string{"session_id": "eq." + sessionID}, "return=minimal")
+		if err != nil || upd.StatusCode >= 400 {
+			return fmt.Errorf("user_sessions patch failed")
 		}
-		if strings.TrimSpace(m.Content) == "" {
-			continue
-		}
-		input = append(input, responsesInputMessage{
-			Role:    role,
-			Content: m.Content,
-		})
+		return nil
 	}
-
-	// Add latest user message
-	input = append(input, responsesInputMessage{
-		Role:    "user",
-		Content: userText,
-	})
-
-	reqBody := responsesCreateRequest{
-		Model:           model,
-		Input:           input,
-		Instructions:    instructions,
-		Truncation:      "auto",
-		MaxOutputTokens: maxOutputTokens,
-		// Ask for plain text output
-		Text: map[string]any{
-			"format":    map[string]any{"type": "text"},
-			"verbosity": verbosity,
-		},
+	if ins.StatusCode >= 400 {
+		return fmt.Errorf("user_sessions insert failed")
 	}
+	return nil
+}
 
-	replyText, err := o.createResponse(reqBody)
+func getLatestOpenConversationID(client *http.Client, userID string) (string, error) {
+	res, err := sbGet(client, "conversations", map[string]string{"select": "id,updated_at", "user_id": "eq." + userID, "status": "eq.open", "order": "updated_at.desc", "limit": "1"})
 	if err != nil {
 		return "", err
 	}
-
-	if len(replyText) > 800 {
-		rewriteReq := responsesCreateRequest{
-			Model:        model,
-			Instructions: "Rewrite the above in <= 4 bullets, <= 450 chars, keep facts.",
-			Input: []responsesInputMessage{{
-				Role:    "user",
-				Content: replyText,
-			}},
-			Truncation:      "auto",
-			MaxOutputTokens: 90,
-			Text: map[string]any{
-				"format":    map[string]any{"type": "text"},
-				"verbosity": normalizeVerbosity(model, "low"),
-			},
-		}
-		rewritten, rewriteErr := o.createResponse(rewriteReq)
-		if rewriteErr == nil && strings.TrimSpace(rewritten) != "" {
-			replyText = rewritten
-		}
+	rows := toSliceMap(res)
+	if len(rows) == 0 {
+		return "", nil
 	}
-
-	return strings.TrimSpace(replyText), nil
+	return asString(rows[0]["id"]), nil
 }
 
-func (o *OpenAIClient) createResponse(reqBody responsesCreateRequest) (string, error) {
-	return o.createResponseWithRetry(reqBody, 0)
-}
-
-func (o *OpenAIClient) createResponseWithRetry(reqBody responsesCreateRequest, attempt int) (string, error) {
-
-	j, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("openai marshal error: %w", err)
+func ensureOpenConversation(client *http.Client, userID, sessionID, channel, locale string, metadata map[string]any) (string, error) {
+	cid, _ := getLatestOpenConversationID(client, userID)
+	if cid != "" {
+		_, _ = sbPatch(client, "conversations", map[string]any{"updated_at": isoNow()}, map[string]string{"id": "eq." + cid}, "return=minimal")
+		return cid, nil
 	}
-
-	req, err := http.NewRequest("POST", "https://api.openai.com/v1/responses", bytes.NewReader(j))
+	convMeta := merge(map[string]any{"session_id": sessionID}, metadata)
+	ins, err := sbPost(client, "conversations", map[string]any{"user_id": userID, "status": "open", "channel": channel, "locale": locale, "metadata": convMeta}, nil, "return=representation")
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+o.APIKey)
+	if ins.StatusCode >= 400 {
+		return "", fmt.Errorf("conversations insert failed")
+	}
+	rows := toSliceMap(ins)
+	if len(rows) == 0 {
+		return "", errors.New("missing conversation id")
+	}
+	return asString(rows[0]["id"]), nil
+}
+
+func loadConversationMessages(client *http.Client, conversationID string, limit int) ([]map[string]any, error) {
+	res, err := sbGet(client, "messages", map[string]string{"select": "role,content,created_at", "conversation_id": "eq." + conversationID, "order": "created_at.asc", "limit": strconv.Itoa(limit)})
+	if err != nil {
+		return nil, err
+	}
+	rows := toSliceMap(res)
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, map[string]any{"role": row["role"], "content": row["content"], "created_at": row["created_at"]})
+	}
+	return out, nil
+}
+
+func sbInsertToolCall(client *http.Client, conversationID, toolName, status string, requestBody, responseBody map[string]any) error {
+	_, err := sbPost(client, "tool_calls", map[string]any{"conversation_id": conversationID, "tool_name": toolName, "status": status, "request": requestBody, "response": responseBody}, nil, "return=minimal")
+	return err
+}
+
+func sbInsertEvent(client *http.Client, userID, conversationID, eventType, source string, payload map[string]any) error {
+	_, err := sbPost(client, "events", map[string]any{"user_id": userID, "conversation_id": conversationID, "event_type": eventType, "source": source, "payload": payload}, nil, "return=minimal")
+	return err
+}
+
+func openAIResponses(client *http.Client, key string, payload map[string]any, timeout time.Duration) (map[string]any, error) {
+	j, _ := json.Marshal(payload)
+	req, _ := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/responses", bytes.NewReader(j))
+	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	cl := *client
+	cl.Timeout = timeout
+	res, body, err := doReqWithClient(&cl, req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	out, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		if attempt == 0 {
-			if retried, reply, retryErr := o.retryWithoutUnsupportedOptions(reqBody, out); retried {
-				if retryErr != nil {
-					return "", retryErr
-				}
-				return reply, nil
-			}
-		}
-		return "", fmt.Errorf("openai responses api error (%d): %s", resp.StatusCode, string(out))
+	if res.StatusCode >= 400 {
+		return nil, fmt.Errorf("openai error %d: %s", res.StatusCode, string(body))
 	}
-
-	var parsed responsesCreateResponse
-	if err := json.Unmarshal(out, &parsed); err != nil {
-		return "", fmt.Errorf("openai parse error: %w | raw=%s", err, string(out))
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
 	}
-	if parsed.Error != nil {
-		return "", fmt.Errorf("openai error (%s): %s", parsed.Error.Code, parsed.Error.Message)
-	}
-
-	if reply := extractParsedResponseText(parsed); reply != "" {
-		return reply, nil
-	}
-
-	if fallback := extractResponseTextFallback(out); fallback != "" {
-		return fallback, nil
-	}
-
-	if parsed.Status == "incomplete" && attempt == 0 {
-		reason := ""
-		if parsed.IncompleteDetails != nil {
-			reason = parsed.IncompleteDetails.Reason
-		}
-		if reason == "max_output_tokens" || reason == "" {
-			retryReq := reqBody
-			if retryReq.MaxOutputTokens <= 0 {
-				retryReq.MaxOutputTokens = 180
-			}
-			retryReq.MaxOutputTokens = min(retryReq.MaxOutputTokens*2, 1200)
-			if strings.TrimSpace(retryReq.Instructions) == "" {
-				retryReq.Instructions = "Return a direct plain-text answer."
-			} else {
-				retryReq.Instructions += " Return a direct plain-text answer."
-			}
-			if retryReq.Text == nil {
-				retryReq.Text = map[string]any{}
-			}
-			retryReq.Text["format"] = map[string]any{"type": "text"}
-			retryReq.Text["verbosity"] = normalizeVerbosity(retryReq.Model, "low")
-			return o.createResponseWithRetry(retryReq, attempt+1)
-		}
-		if reason == "content_filter" {
-			return "I can’t help with that request as written. Please rephrase and avoid sharing sensitive personal details.", nil
-		}
-	}
-
-	return "", fmt.Errorf("openai: no text found in response (status=%s)", parsed.Status)
+	return parsed, nil
 }
 
-func (o *OpenAIClient) retryWithoutUnsupportedOptions(reqBody responsesCreateRequest, responseBody []byte) (bool, string, error) {
-	body := strings.ToLower(string(responseBody))
-	if !strings.Contains(body, "verbosity") {
-		return false, "", nil
+func responsesText(resp map[string]any) string {
+	if s, ok := resp["output_text"].(string); ok && strings.TrimSpace(s) != "" {
+		return strings.TrimSpace(s)
 	}
-	if reqBody.Text == nil {
-		return false, "", nil
-	}
-	if _, exists := reqBody.Text["verbosity"]; !exists {
-		return false, "", nil
-	}
-
-	retryReq := reqBody
-	retryText := map[string]any{}
-	for k, v := range reqBody.Text {
-		if k == "verbosity" {
-			continue
-		}
-		retryText[k] = v
-	}
-	retryReq.Text = retryText
-
-	reply, err := o.createResponseWithRetry(retryReq, 1)
-	if err != nil {
-		return true, "", err
-	}
-	return true, reply, nil
-}
-
-func extractParsedResponseText(parsed responsesCreateResponse) string {
-	if strings.TrimSpace(parsed.OutputText) != "" {
-		return strings.TrimSpace(parsed.OutputText)
-	}
-
-	var reply strings.Builder
-	for _, item := range parsed.Output {
-		// Some Responses payloads include output items that are not "message" and may not include role.
-		// Extract text from:
-		//  - assistant "message" items (from content parts), and
-		//  - non-message items (e.g., "output_text") that place text at the top level.
-		if item.Type == "message" {
-			if item.Role != "assistant" {
+	parts := []string{}
+	if out, ok := resp["output"].([]any); ok {
+		for _, item := range out {
+			m, ok := item.(map[string]any)
+			if !ok {
 				continue
 			}
-			for _, c := range item.Content {
-				if c.Type != "output_text" && c.Type != "text" && c.Type != "refusal" {
+			content, ok := m["content"].([]any)
+			if !ok {
+				continue
+			}
+			for _, c := range content {
+				cm, ok := c.(map[string]any)
+				if !ok {
 					continue
 				}
-				reply.WriteString(extractTextValue(c.Text))
-				reply.WriteString(extractTextValue(c.Refusal))
-			}
-			continue
-		}
-
-		// Non-message output items: try both text and refusal.
-		reply.WriteString(extractTextValue(item.Text))
-		reply.WriteString(extractTextValue(item.Refusal))
-	}
-
-	return strings.TrimSpace(reply.String())
-}
-
-func extractTextValue(v any) string {
-	switch t := v.(type) {
-	case string:
-		return t
-	case map[string]any:
-		if val, ok := t["value"].(string); ok {
-			return val
-		}
-		if txt, ok := t["text"].(string); ok {
-			return txt
-		}
-	}
-	return ""
-}
-
-func parseFactsJSON(raw string) map[string]string {
-	data := map[string]any{}
-	if err := json.Unmarshal([]byte(raw), &data); err != nil {
-		return map[string]string{}
-	}
-	out := map[string]string{}
-	for _, key := range []string{"name", "email", "phone", "order_id", "address", "intent", "notes"} {
-		v, ok := data[key]
-		if !ok || v == nil {
-			continue
-		}
-		if s, ok := v.(string); ok {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				out[key] = s
-			}
-		}
-	}
-	if ac, ok := data["address_components"].(map[string]any); ok {
-		for _, key := range []string{"line1", "line2", "city", "state", "postal_code", "country"} {
-			v, ok := ac[key]
-			if !ok || v == nil {
-				continue
-			}
-			if sv, ok := v.(string); ok {
-				sv = strings.TrimSpace(sv)
-				if sv != "" {
-					out["address_"+key] = sv
+				if asString(cm["type"]) == "output_text" {
+					if t := asString(cm["text"]); strings.TrimSpace(t) != "" {
+						parts = append(parts, t)
+					}
 				}
 			}
 		}
 	}
-	if v, ok := data["confidence"].(float64); ok {
-		out["confidence"] = strconv.Itoa(int(v))
-	}
-	if v, ok := data["needs_verification"].(bool); ok {
-		if v {
-			out["needs_verification"] = "true"
-		} else {
-			out["needs_verification"] = "false"
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func responsesFirstJSON(resp map[string]any) map[string]any {
+	if s, ok := resp["output_text"].(string); ok && strings.TrimSpace(s) != "" {
+		var v map[string]any
+		if json.Unmarshal([]byte(s), &v) == nil {
+			return v
 		}
 	}
-	if out["email"] != "" {
-		out["email"] = normalizeEmail(out["email"])
+	if out, ok := resp["output"].([]any); ok {
+		for _, item := range out {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			content, ok := m["content"].([]any)
+			if !ok {
+				continue
+			}
+			for _, c := range content {
+				cm, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				if asString(cm["type"]) != "output_text" {
+					continue
+				}
+				t := strings.TrimSpace(asString(cm["text"]))
+				if t == "" {
+					continue
+				}
+				var v map[string]any
+				if json.Unmarshal([]byte(t), &v) == nil {
+					return v
+				}
+			}
+		}
 	}
-	if out["phone"] != "" {
-		out["phone"] = normalizePhone(out["phone"])
+	return nil
+}
+
+func sbGet(client *http.Client, path string, params map[string]string) (*http.Response, error) {
+	base, key, err := requireSupabase()
+	if err != nil {
+		return nil, err
+	}
+	u := fmt.Sprintf("%s/rest/v1/%s", strings.TrimRight(base, "/"), strings.TrimLeft(path, "/"))
+	q := url.Values{}
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	req, _ := http.NewRequest(http.MethodGet, u+"?"+q.Encode(), nil)
+	addSBHeaders(req, key, "")
+	res, body, err := doReqWithClient(client, req)
+	if err != nil {
+		return nil, err
+	}
+	res.Body = io.NopCloser(bytes.NewReader(body))
+	return res, nil
+}
+
+func sbPost(client *http.Client, path string, body any, params map[string]string, prefer string) (*http.Response, error) {
+	return sbDo(client, http.MethodPost, path, body, params, prefer)
+}
+func sbPatch(client *http.Client, path string, body any, params map[string]string, prefer string) (*http.Response, error) {
+	return sbDo(client, http.MethodPatch, path, body, params, prefer)
+}
+func sbDo(client *http.Client, method, path string, payload any, params map[string]string, prefer string) (*http.Response, error) {
+	base, key, err := requireSupabase()
+	if err != nil {
+		return nil, err
+	}
+	u := fmt.Sprintf("%s/rest/v1/%s", strings.TrimRight(base, "/"), strings.TrimLeft(path, "/"))
+	q := url.Values{}
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	j, _ := json.Marshal(payload)
+	req, _ := http.NewRequest(method, u+"?"+q.Encode(), bytes.NewReader(j))
+	addSBHeaders(req, key, prefer)
+	res, body, err := doReqWithClient(client, req)
+	if err != nil {
+		return nil, err
+	}
+	res.Body = io.NopCloser(bytes.NewReader(body))
+	return res, nil
+}
+
+func addSBHeaders(req *http.Request, key, prefer string) {
+	req.Header.Set("apikey", key)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	if prefer != "" {
+		req.Header.Set("Prefer", prefer)
+	}
+}
+
+func requireOpenAIKey() (string, error) {
+	loadSecretsFromFiles()
+	k := getConfig().OpenAIAPIKey
+	if k == "" {
+		return "", errors.New("Missing OpenAI API key. Put it in ai_api.txt or env OPENAI_API_KEY.")
+	}
+	return k, nil
+}
+
+func requireSupabase() (string, string, error) {
+	loadSecretsFromFiles()
+	c := getConfig()
+	if strings.TrimSpace(c.SupabaseURL) == "" || strings.TrimSpace(c.SupabaseServiceRole) == "" {
+		return "", "", errors.New("Missing Supabase URL or service_role key. Put them in supabase_url.txt + service_role.txt (or env vars).")
+	}
+	return strings.TrimRight(c.SupabaseURL, "/"), c.SupabaseServiceRole, nil
+}
+
+func loadSecretsFromFiles() {
+	exe, _ := os.Executable()
+	here := filepath.Dir(exe)
+	if wd, err := os.Getwd(); err == nil {
+		here = wd
+	}
+	fileSupabaseURL := readText(filepath.Join(here, "supabase_url.txt"))
+	fileServiceRole := readText(filepath.Join(here, "service_role.txt"))
+	fileOpenAI := readText(filepath.Join(here, "ai_api.txt"))
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	if v := os.Getenv("SUPABASE_URL"); v != "" {
+		cfg.SupabaseURL = v
+	} else if cfg.SupabaseURL == "" {
+		cfg.SupabaseURL = fileSupabaseURL
+	}
+	if v := os.Getenv("SUPABASE_SERVICE_ROLE"); v != "" {
+		cfg.SupabaseServiceRole = v
+	} else if cfg.SupabaseServiceRole == "" {
+		cfg.SupabaseServiceRole = fileServiceRole
+	}
+	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
+		cfg.OpenAIAPIKey = v
+	} else if cfg.OpenAIAPIKey == "" {
+		cfg.OpenAIAPIKey = fileOpenAI
+	}
+	if cfg.PreferredModel == "" {
+		cfg.PreferredModel = "gpt-5-mini"
+	}
+}
+
+func getConfig() RuntimeConfig { cfgMu.RLock(); defer cfgMu.RUnlock(); return cfg }
+
+func maskConfig(c RuntimeConfig) map[string]any {
+	out := map[string]any{"supabase_url": c.SupabaseURL, "supabase_service_role": c.SupabaseServiceRole, "openai_api_key": c.OpenAIAPIKey, "preferred_model": c.PreferredModel}
+	if out["supabase_service_role"] != "" {
+		out["supabase_service_role"] = "****"
+	}
+	if out["openai_api_key"] != "" {
+		out["openai_api_key"] = "****"
 	}
 	return out
 }
 
-func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText string) (map[string]string, error) {
-	_ = ctx
-	if strings.TrimSpace(userText) == "" {
-		return map[string]string{}, nil
+func getOrSetAnonID(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie(anonCookie); err == nil && c.Value != "" {
+		return c.Value
 	}
+	id := newUUID()
+	http.SetCookie(w, &http.Cookie{Name: anonCookie, Value: id, MaxAge: anonCookieMaxAge, SameSite: http.SameSiteLaxMode, Secure: false, HttpOnly: false, Path: "/"})
+	return id
+}
 
-	factsModel := extractorModelDefault
-	buildReq := func(strict bool) responsesCreateRequest {
-		return responsesCreateRequest{
-			Model:        factsModel,
-			Instructions: "You are an information extraction engine for an ecommerce chatbot. Return ONLY JSON that matches the schema exactly. Fill every required field, including nested address_components keys. For missing values use null. intent MUST be one of the allowed enum values. confidence MUST be an integer 0-100. needs_verification MUST be true/false. Extract only user-provided facts (do not infer). Normalize email to lowercase. Normalize phone to digits-only while preserving a leading + when provided.",
-			Input: []responsesInputMessage{{
-				Role:    "user",
-				Content: userText,
-			}},
-			Truncation:      "auto",
-			MaxOutputTokens: 140,
-			Text: map[string]any{
-				"format": map[string]any{
-					"type":   "json_schema",
-					"name":   extractionJSONSchema["name"],
-					"schema": extractionJSONSchema["schema"],
-					"strict": strict,
-				},
-				"verbosity": normalizeVerbosity(factsModel, "low"),
-			},
+func corsMiddleware(next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, o := range uiOrigins {
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", "*")
+			w.Header().Set("Access-Control-Allow-Headers", "*")
 		}
-	}
-
-	strictReq := buildReq(true)
-	logExtractionPayload(strictReq)
-	strictReply, strictErr := o.createResponse(strictReq)
-	if strictErr == nil {
-		return parseFactsJSON(strictReply), nil
-	}
-
-	log.Printf("fact extraction strict=true failed; retrying strict=false to diagnose schema rigidity: %v", strictErr)
-	relaxedReq := buildReq(false)
-	logExtractionPayload(relaxedReq)
-	relaxedReply, relaxedErr := o.createResponse(relaxedReq)
-	if relaxedErr == nil {
-		log.Printf("fact extraction succeeded with strict=false; likely schema-rigidity issue: %v", strictErr)
-		return parseFactsJSON(relaxedReply), nil
-	}
-
-	return nil, fmt.Errorf("strict extraction failed: %w | relaxed extraction failed: %v", strictErr, relaxedErr)
-}
-
-func logExtractionPayload(reqBody responsesCreateRequest) {
-	responseFormat := map[string]any{}
-	if reqBody.Text != nil {
-		if format, ok := reqBody.Text["format"]; ok {
-			if typed, ok := format.(map[string]any); ok {
-				responseFormat = typed
-			}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(204)
+			return
 		}
-	}
-	payload := map[string]any{
-		"model":           reqBody.Model,
-		"response_format": responseFormat,
-	}
-	b, _ := json.Marshal(payload)
-	log.Printf("extraction request payload: %s", string(b))
-}
-
-func normalizeVerbosity(model, requested string) string {
-	model = strings.ToLower(strings.TrimSpace(model))
-	requested = strings.ToLower(strings.TrimSpace(requested))
-	if requested == "" {
-		requested = "low"
-	}
-
-	if model == "gpt-4.1-mini" || model == "gpt-4o-mini" {
-		return "medium"
-	}
-
-	switch requested {
-	case "low", "medium", "high":
-		return requested
-	default:
-		return "low"
-	}
-}
-
-func extractResponseTextFallback(raw []byte) string {
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return ""
-	}
-
-	if s, ok := payload["output_text"].(string); ok && strings.TrimSpace(s) != "" {
-		return strings.TrimSpace(s)
-	}
-
-	items, _ := payload["output"].([]any)
-	var reply strings.Builder
-	for _, itemAny := range items {
-		item, ok := itemAny.(map[string]any)
-		if !ok {
-			continue
-		}
-		itype, _ := item["type"].(string)
-		if itype == "message" {
-			if role, _ := item["role"].(string); role != "assistant" {
-				continue
-			}
-			content, _ := item["content"].([]any)
-			for _, partAny := range content {
-				part, ok := partAny.(map[string]any)
-				if !ok {
-					continue
-				}
-				reply.WriteString(extractTextValue(part["text"]))
-				reply.WriteString(extractTextValue(part["refusal"]))
-			}
-			continue
-		}
-
-		// Non-message items (e.g., output_text) often have no role.
-		reply.WriteString(extractTextValue(item["text"]))
-		reply.WriteString(extractTextValue(item["refusal"]))
-	}
-
-	return strings.TrimSpace(reply.String())
-}
-
-// -------- cookies --------
-
-func newSessionID() (string, error) {
-	b := make([]byte, 18)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return "anon_" + base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-func cookieSecure() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("COOKIE_SECURE")))
-	return v == "true" || v == "1" || v == "yes"
-}
-
-func ensureSessionCookie(w http.ResponseWriter, r *http.Request) (string, bool, error) {
-	if c, err := r.Cookie(sessionCookieName); err == nil && strings.TrimSpace(c.Value) != "" {
-		return c.Value, false, nil
-	}
-	sid, err := newSessionID()
-	if err != nil {
-		return "", false, err
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    sid,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   cookieSecure(),
-		Expires:  time.Now().Add(90 * 24 * time.Hour),
+		next.ServeHTTP(w, r)
 	})
-	return sid, true, nil
 }
 
-func readSessionID(r *http.Request) (string, error) {
-	c, err := r.Cookie(sessionCookieName)
-	if err != nil || strings.TrimSpace(c.Value) == "" {
-		return "", fmt.Errorf("missing session cookie")
-	}
-	return c.Value, nil
+func doReq(req *http.Request, timeout time.Duration) (*http.Response, []byte, error) {
+	client := &http.Client{Timeout: timeout}
+	return doReqWithClient(client, req)
 }
 
-// -------- helpers --------
-
-func getenvDefault(k, def string) string {
-	v := strings.TrimSpace(os.Getenv(k))
-	if v == "" {
-		return def
+func doReqWithClient(client *http.Client, req *http.Request) (*http.Response, []byte, error) {
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, nil, err
 	}
-	return v
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	return res, b, nil
 }
 
-func getenvIntDefault(k string, def int) int {
-	v := strings.TrimSpace(os.Getenv(k))
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return def
-	}
-	return n
+func toSliceMap(res *http.Response) []map[string]any {
+	body, _ := io.ReadAll(res.Body)
+	var out []map[string]any
+	_ = json.Unmarshal(body, &out)
+	return out
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeErr(w http.ResponseWriter, err error) {
+	writeJSON(w, 502, map[string]any{"detail": err.Error()})
+}
+func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// -------- web handlers --------
-
-type ChatHTTPReq struct {
-	Message string `json:"message"`
-	Channel string `json:"channel"`
-	Locale  string `json:"locale"`
-	Model   string `json:"model,omitempty"`
+func extractorFallback() map[string]any {
+	return map[string]any{"name": nil, "email": nil, "phone": nil, "order_id": nil, "address": nil, "address_components": map[string]any{"line1": nil, "line2": nil, "city": nil, "state": nil, "postal_code": nil, "country": nil}, "intent": "other", "confidence": 0, "needs_verification": false, "notes": "Extractor failed"}
 }
 
-func chatOutputSchemaForModel(model string) map[string]any {
-	return map[string]any{
-		"model": model,
-		"format": map[string]any{
-			"type": "text",
-		},
+func isoNow() string  { return time.Now().UTC().Format(time.RFC3339) }
+func newUUID() string { return fmt.Sprintf("%d", time.Now().UnixNano()) }
+func splitCSV(s string) []string {
+	p := strings.Split(s, ",")
+	out := []string{}
+	for _, v := range p {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			out = append(out, v)
+		}
 	}
+	return out
 }
-
-func extractionOutputSchemaInfo() map[string]any {
-	return map[string]any{
-		"model": extractorModelDefault,
-		"format": map[string]any{
-			"type":   "json_schema",
-			"name":   extractionJSONSchema["name"],
-			"schema": extractionJSONSchema["schema"],
-			"strict": true,
-		},
-	}
-}
-
-type ChatHistoryHTTPResp struct {
-	SessionID      string       `json:"session_id"`
-	ConversationID string       `json:"conversation_id,omitempty"`
-	Messages       []MessageRow `json:"messages"`
-}
-
-type modelsListResponse struct {
-	Data []struct {
-		ID string `json:"id"`
-	} `json:"data"`
-}
-
-func (o *OpenAIClient) ListModels() ([]string, error) {
-	req, err := http.NewRequest("GET", "https://api.openai.com/v1/models", nil)
+func readText(path string) string {
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return ""
 	}
-	req.Header.Set("Authorization", "Bearer "+o.APIKey)
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("openai models api error (%d): %s", resp.StatusCode, string(body))
-	}
-	var parsed modelsListResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("openai models parse error: %w", err)
-	}
-	out := make([]string, 0, len(parsed.Data))
-	for _, m := range parsed.Data {
-		if strings.TrimSpace(m.ID) != "" {
-			out = append(out, m.ID)
-		}
-	}
-	sort.Strings(out)
-	return out, nil
+	return strings.TrimSpace(string(b))
 }
-
-func main() {
-	sbURL := strings.TrimRight(os.Getenv("SUPABASE_URL"), "/")
-	sbKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
-	oaKey := os.Getenv("OPENAI_API_KEY")
-	oaModel := getenvDefault("OPENAI_MODEL", "gpt-5-mini")
-
-	tools := &Tools{
-		Shopify:  NoopShopify{},
-		ZohoCRM:  NoopZohoCRM{},
-		ZohoDesk: NoopZohoDesk{},
-		Brevo:    NoopBrevo{},
-		WhatsApp: NoopWhatsApp{},
+func getenv(k, d string) string {
+	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+		return v
 	}
-
-	routingSpecs := RoutingTable()
-
-	// Static files with cookie initialization
-	fs := http.FileServer(http.Dir("./static"))
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_, _, err := ensureSessionCookie(w, r)
-		if err != nil {
-			http.Error(w, "failed to set session", 500)
-			return
+	return d
+}
+func normalizeEmail(x string) string { return strings.ToLower(strings.TrimSpace(x)) }
+func normalizePhone(x string) string {
+	x = strings.TrimSpace(x)
+	if strings.HasPrefix(x, "+") {
+		return "+" + onlyDigits(x[1:])
+	}
+	return onlyDigits(x)
+}
+func onlyDigits(s string) string {
+	b := strings.Builder{}
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
 		}
-		fs.ServeHTTP(w, r)
-	})
-
-	http.HandleFunc("/whoami", func(w http.ResponseWriter, r *http.Request) {
-		sid, _, err := ensureSessionCookie(w, r)
-		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
-			return
-		}
-		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
-		if effectiveSBURL == "" {
-			effectiveSBURL = sbURL
-		}
-		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
-		if effectiveSBKey == "" {
-			effectiveSBKey = sbKey
-		}
-		conversationID := ""
-		if effectiveSBURL != "" && effectiveSBKey != "" {
-			sb := &SupabaseClient{BaseURL: effectiveSBURL, APIKey: effectiveSBKey}
-			if conv, found, err := sb.GetOpenConversationByAnonymousID(sid); err == nil && found {
-				conversationID = conv.ID
-			}
-		}
-		writeJSON(w, 200, map[string]any{"session_id": sid, "conversation_id": conversationID, "cookie_id": sid})
-	})
-
-	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		_, _, _ = ensureSessionCookie(w, r)
-		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
-		if effectiveSBURL == "" {
-			effectiveSBURL = sbURL
-		}
-		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
-		if effectiveSBKey == "" {
-			effectiveSBKey = sbKey
-		}
-		effectiveOAKey := strings.TrimSpace(r.Header.Get("X-OpenAI-Api-Key"))
-		if effectiveOAKey == "" {
-			effectiveOAKey = oaKey
-		}
-		aiConnected := false
-		aiErr := ""
-		if effectiveOAKey != "" {
-			oac := &OpenAIClient{APIKey: effectiveOAKey, Model: oaModel}
-			if _, err := oac.ListModels(); err != nil {
-				aiErr = err.Error()
-			} else {
-				aiConnected = true
-			}
-		} else {
-			aiErr = "missing OpenAI API key"
-		}
-		supabaseConnected := false
-		supabaseErr := ""
-		if effectiveSBURL != "" && effectiveSBKey != "" {
-			sbc := &SupabaseClient{BaseURL: effectiveSBURL, APIKey: effectiveSBKey}
-			if err := sbc.Ping(); err != nil {
-				supabaseErr = err.Error()
-			} else {
-				supabaseConnected = true
-			}
-		} else {
-			supabaseErr = "missing Supabase URL or service role key"
-		}
-		writeJSON(w, 200, map[string]any{
-			"backend":  map[string]any{"connected": true},
-			"ai":       map[string]any{"connected": aiConnected, "error": aiErr},
-			"supabase": map[string]any{"connected": supabaseConnected, "error": supabaseErr},
-		})
-	})
-
-	http.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		effectiveOAKey := strings.TrimSpace(r.Header.Get("X-OpenAI-Api-Key"))
-		if effectiveOAKey == "" {
-			effectiveOAKey = oaKey
-		}
-		if effectiveOAKey == "" {
-			writeJSON(w, 400, map[string]any{"error": "missing OpenAI API key"})
-			return
-		}
-		client := &OpenAIClient{APIKey: effectiveOAKey, Model: oaModel}
-		models, err := client.ListModels()
-		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, map[string]any{"models": models})
-	})
-
-	http.HandleFunc("/extraction-schema", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		writeJSON(w, 200, map[string]any{"response_format": map[string]any{"type": "json_schema", "json_schema": extractionJSONSchema}})
-	})
-
-	http.HandleFunc("/new-session", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		sid, err := newSessionID()
-		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
-			return
-		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookieName,
-			Value:    sid,
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-			Secure:   cookieSecure(),
-			Expires:  time.Now().Add(90 * 24 * time.Hour),
-		})
-		writeJSON(w, 200, map[string]any{"session_id": sid})
-	})
-
-	http.HandleFunc("/new-conversation", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		sid, _, err := ensureSessionCookie(w, r)
-		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
-			return
-		}
-		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
-		if effectiveSBURL == "" {
-			effectiveSBURL = sbURL
-		}
-		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
-		if effectiveSBKey == "" {
-			effectiveSBKey = sbKey
-		}
-		if effectiveSBURL == "" || effectiveSBKey == "" {
-			writeJSON(w, 400, map[string]any{"error": "missing supabase configuration"})
-			return
-		}
-		sbc := &SupabaseClient{BaseURL: effectiveSBURL, APIKey: effectiveSBKey}
-		if err := sbc.CloseOpenConversationsByAnonymousID(sid); err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, map[string]any{"ok": true})
-	})
-
-	http.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if _, _, err := ensureSessionCookie(w, r); err != nil {
-			writeJSON(w, 500, map[string]any{"error": "failed to establish session"})
-			return
-		}
-		sid, err := readSessionID(r)
-		if err != nil {
-			writeJSON(w, 400, map[string]any{"error": "missing session"})
-			return
-		}
-
-		var req ChatHTTPReq
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, 400, map[string]any{"error": "invalid json"})
-			return
-		}
-		req.Message = strings.TrimSpace(req.Message)
-		if req.Message == "" {
-			writeJSON(w, 400, map[string]any{"error": "message required"})
-			return
-		}
-		if req.Channel == "" {
-			req.Channel = "web"
-		}
-		if req.Locale == "" {
-			req.Locale = "en-IN"
-		}
-		req.Model = strings.TrimSpace(req.Model)
-		if req.Model == "" {
-			writeJSON(w, 400, map[string]any{"error": "model required: select a chat model"})
-			return
-		}
-
-		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
-		if effectiveSBURL == "" {
-			effectiveSBURL = sbURL
-		}
-
-		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
-		if effectiveSBKey == "" {
-			effectiveSBKey = sbKey
-		}
-
-		effectiveOAKey := strings.TrimSpace(r.Header.Get("X-OpenAI-Api-Key"))
-		if effectiveOAKey == "" {
-			effectiveOAKey = oaKey
-		}
-
-		if effectiveSBURL == "" || effectiveSBKey == "" || effectiveOAKey == "" {
-			writeJSON(w, 400, map[string]any{
-				"error": "missing configuration: provide Supabase URL, Supabase service role key, and OpenAI API key (headers or env vars)",
-			})
-			return
-		}
-
-		effectiveRouter := &Router{
-			SB: &SupabaseClient{
-				BaseURL: effectiveSBURL,
-				APIKey:  effectiveSBKey,
-			},
-			LLM: &OpenAIClient{
-				APIKey: effectiveOAKey,
-				Model:  req.Model,
-			},
-			Tools: tools,
-			Specs: routingSpecs,
-		}
-
-		out, err := effectiveRouter.Handle(r.Context(), Inbound{
-			Channel:   req.Channel,
-			Locale:    req.Locale,
-			SessionID: sid,
-			UserText:  req.Message,
-		})
-		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, map[string]any{
-			"intent":                   string(out.Intent),
-			"reply":                    out.Reply,
-			"session_id":               sid,
-			"cookie_id":                sid,
-			"conversation_id":          out.ConversationID,
-			"chat_model":               effectiveRouter.LLM.Model,
-			"extracted":                out.Extracted,
-			"extractor_model":          extractorModelDefault,
-			"extractor_error":          out.ExtractorError,
-			"chat_output_schema":       chatOutputSchemaForModel(effectiveRouter.LLM.Model),
-			"extraction_output_schema": extractionOutputSchemaInfo(),
-		})
-	})
-
-	http.HandleFunc("/chat-history", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		sid, _, err := ensureSessionCookie(w, r)
-		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": "failed to establish session"})
-			return
-		}
-
-		effectiveSBURL := strings.TrimRight(strings.TrimSpace(r.Header.Get("X-Supabase-Url")), "/")
-		if effectiveSBURL == "" {
-			effectiveSBURL = sbURL
-		}
-		effectiveSBKey := strings.TrimSpace(r.Header.Get("X-Supabase-Service-Role-Key"))
-		if effectiveSBKey == "" {
-			effectiveSBKey = sbKey
-		}
-		if effectiveSBURL == "" || effectiveSBKey == "" {
-			writeJSON(w, 400, map[string]any{"error": "missing supabase configuration"})
-			return
-		}
-
-		sbc := &SupabaseClient{BaseURL: effectiveSBURL, APIKey: effectiveSBKey}
-		conv, found, err := sbc.GetOpenConversationByAnonymousID(sid)
-		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
-			return
-		}
-		if !found {
-			writeJSON(w, 200, ChatHistoryHTTPResp{SessionID: sid, Messages: []MessageRow{}})
-			return
-		}
-		messages, err := sbc.FetchRecentMessages(conv.ID, 5)
-		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, ChatHistoryHTTPResp{SessionID: sid, ConversationID: conv.ID, Messages: messages})
-	})
-
-	port := getenvDefault("PORT", "8081")
-	log.Printf("Server running on http://localhost:%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	}
+	return b.String()
+}
+func asString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+func toInt(v any) int {
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case int:
+		return t
+	case string:
+		i, _ := strconv.Atoi(t)
+		return i
+	default:
+		return 0
+	}
+}
+func merge(a, b map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		out[k] = v
+	}
+	return out
+}
+func reverse[T any](s []T) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+}
+func ternary[T any](cond bool, a, b T) T {
+	if cond {
+		return a
+	}
+	return b
+}
+func errToAny(err error) any {
+	if err == nil {
+		return nil
+	}
+	return err.Error()
 }
