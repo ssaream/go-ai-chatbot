@@ -335,13 +335,13 @@
 
     const sbOk = await testSupabase();
     if (!sbOk) {
-      addMsg("system", "Supabase connection failed. Fix supabase_url.txt/service_role.txt and restart backend.");
+      addMsg("system", "Supabase connection failed. Set SUPABASE_URL + SUPABASE_SERVICE_ROLE (or SUPABASE_SERVICE_ROLE_KEY) and restart backend.");
       return;
     }
 
     const aiOk = await loadModels();
     if (!aiOk) {
-      addMsg("system", "AI connection failed. Fix ai_api.txt and restart backend.");
+      addMsg("system", "AI connection failed. Set OPENAI_API_KEY and restart backend.");
       return;
     }
 
