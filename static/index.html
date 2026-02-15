@@ -6,8 +6,9 @@
   <title>AI Chatbot MVP</title>
   <style>
     body { font-family: system-ui, Arial; margin: 0; background: #f6f8fb; }
-    .layout { max-width: 1200px; margin: 20px auto; padding: 0 12px; display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+    .layout { max-width: 1300px; margin: 10px auto; padding: 0 12px; display: grid; grid-template-columns: 2fr 1fr; gap: 12px; min-height: calc(100vh - 20px); }
     .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; background: #fff; }
+    .chat-card { display: flex; flex-direction: column; min-height: calc(100vh - 24px); }
     .meta { display:flex; gap:10px; flex-wrap: wrap; align-items:center; margin-bottom: 10px; color:#555; font-size: 13px; }
     code { background: #f2f2f2; padding: 2px 6px; border-radius: 6px; }
     .status-wrap { display:grid; grid-template-columns: repeat(3,1fr); gap:8px; margin-bottom: 10px; }
@@ -20,22 +21,25 @@
     .field label { font-size: 12px; color: #555; }
     .field input, select, textarea { border: 1px solid #ddd; border-radius: 10px; padding: 10px; }
     .hint { font-size: 12px; color: #666; margin-bottom: 10px; }
-    #chatLog { height: 450px; overflow: auto; border: 1px solid #eee; border-radius: 12px; padding: 12px; background: #fafafa; }
+    #chatLog { flex: 1; min-height: 260px; overflow: auto; border: 1px solid #eee; border-radius: 12px; padding: 12px; background: #fafafa; }
     .msg { margin: 10px 0; padding: 10px 12px; border-radius: 12px; max-width: 85%; white-space: pre-wrap; }
     .user { background: #e8f0fe; margin-left: auto; }
     .bot  { background: #fff; border: 1px solid #eee; }
-    .row { display: flex; gap: 10px; margin-top: 12px; }
-    textarea { flex: 1; resize: vertical; min-height: 44px; }
+    .row { display: flex; gap: 10px; margin-top: 12px; position: sticky; bottom: 0; background: #fff; padding-top: 8px; }
+    textarea { flex: 1; resize: vertical; min-height: 72px; max-height: 200px; }
     button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: #111; color: #fff; cursor: pointer; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
-    .side-log { height: 760px; overflow:auto; background:#0f172a; color:#dbeafe; border-radius:10px; padding:10px; font-size:12px; }
-    .line { margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 6px; }
-    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } .side-log { height: 220px; } }
+    .side-log { height: calc(100vh - 120px); overflow:auto; background:#0f172a; color:#dbeafe; border-radius:10px; padding:10px; font-size:12px; }
+    .line { margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; padding: 8px; white-space: pre-wrap; }
+    .line .title { font-weight: 700; margin-bottom: 4px; }
+    .line .meta { margin: 0; color: #cbd5e1; }
+    .line pre { margin: 6px 0 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #e2e8f0; }
+    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; min-height: auto; } .chat-card { min-height: auto; } .side-log { height: 260px; } }
   </style>
 </head>
 <body>
   <div class="layout">
-    <div class="card">
+    <div class="card chat-card">
       <h2>AI Chatbot MVP</h2>
       <div class="meta">
         <div>Cookie ID: <code id="cookieId">...</code> <button id="newSession" type="button">New cookie/session</button></div>
@@ -125,6 +129,16 @@ function normalizeRole(role) {
   return "bot";
 }
 
+function prettyJSON(value) {
+  if (value === undefined) return "-";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
 function logEvent(entry) {
   const line = document.createElement("div");
   line.className = "line";
@@ -138,9 +152,33 @@ function logEvent(entry) {
 
   const status = entry?.status || "info";
   const title = entry?.title || "event";
-  const inputText = entry?.input || "-";
-  const outputText = entry?.output || "-";
-  line.textContent = `${ts} [${status.toUpperCase()}] ${title} | input: ${inputText} | output: ${outputText}`;
+  const inputText = prettyJSON(entry?.input);
+  const outputText = prettyJSON(entry?.output);
+  const schemaText = prettyJSON(entry?.schema);
+
+  const titleEl = document.createElement("div");
+  titleEl.className = "title";
+  titleEl.textContent = `${ts} [${status.toUpperCase()}] ${title}`;
+
+  const inputLabel = document.createElement("div");
+  inputLabel.className = "meta";
+  inputLabel.textContent = "input";
+  const inputPre = document.createElement("pre");
+  inputPre.textContent = inputText;
+
+  const outputLabel = document.createElement("div");
+  outputLabel.className = "meta";
+  outputLabel.textContent = "output";
+  const outputPre = document.createElement("pre");
+  outputPre.textContent = outputText;
+
+  const schemaLabel = document.createElement("div");
+  schemaLabel.className = "meta";
+  schemaLabel.textContent = "output schema";
+  const schemaPre = document.createElement("pre");
+  schemaPre.textContent = schemaText;
+
+  line.append(titleEl, inputLabel, inputPre, outputLabel, outputPre, schemaLabel, schemaPre);
   eventLog.prepend(line);
 }
 
@@ -290,8 +328,25 @@ async function send() {
     sidEl.textContent = data.session_id || sidEl.textContent;
     cookieIdEl.textContent = data.cookie_id || cookieIdEl.textContent;
     convEl.textContent = data.conversation_id || convEl.textContent;
-    logEvent({ status: "ok", title: "chat response", input: text, output: data.reply, model: modelSel.value });
-    logEvent({ status: "ok", title: "model usage", input: `selected=${modelSel.value}`, output: `chat=${data.chat_model || modelSel.value}, extraction=${data.extraction_model || "gpt-4.1-mini"}` });
+    logEvent({
+      status: "ok",
+      title: "chat response",
+      input: {
+        user_text: text,
+        selected_chat_model: modelSel.value,
+        extracted_with_model: "gpt-4.1-mini"
+      },
+      output: {
+        reply: data.reply,
+        intent: data.intent,
+        used_chat_model: data.chat_model,
+        used_extraction_model: data.extraction_model
+      },
+      schema: {
+        chat_output_schema: data.chat_output_schema || { type: "text" },
+        extraction_output_schema: data.extraction_output_schema || null
+      }
+    });
   } catch (e) {
     addMsg("Error: " + e.message, "bot");
     logEvent({ status: "error", title: "chat response", input: text, output: e.message });
