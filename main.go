@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -725,7 +724,7 @@ func requireOpenAIKey() (string, error) {
 	loadSecretsFromFiles()
 	k := getConfig().OpenAIAPIKey
 	if k == "" {
-		return "", errors.New("Missing OpenAI API key. Put it in ai_api.txt or env OPENAI_API_KEY.")
+		return "", errors.New("Missing OpenAI API key. Set OPENAI_API_KEY.")
 	}
 	return k, nil
 }
@@ -734,40 +733,29 @@ func requireSupabase() (string, string, error) {
 	loadSecretsFromFiles()
 	c := getConfig()
 	if strings.TrimSpace(c.SupabaseURL) == "" || strings.TrimSpace(c.SupabaseServiceRole) == "" {
-		return "", "", errors.New("Missing Supabase URL or service_role key. Put them in supabase_url.txt + service_role.txt (or env vars).")
+		return "", "", errors.New("Missing Supabase URL or service_role key. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE (or SUPABASE_SERVICE_ROLE_KEY).")
 	}
 	return strings.TrimRight(c.SupabaseURL, "/"), c.SupabaseServiceRole, nil
 }
 
 func loadSecretsFromFiles() {
-	exe, _ := os.Executable()
-	here := filepath.Dir(exe)
-	if wd, err := os.Getwd(); err == nil {
-		here = wd
-	}
-	fileSupabaseURL := readText(filepath.Join(here, "supabase_url.txt"))
-	fileServiceRole := readText(filepath.Join(here, "service_role.txt"))
-	fileOpenAI := readText(filepath.Join(here, "ai_api.txt"))
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
-	if v := os.Getenv("SUPABASE_URL"); v != "" {
-		cfg.SupabaseURL = v
-	} else if cfg.SupabaseURL == "" {
-		cfg.SupabaseURL = fileSupabaseURL
-	}
-	if v := os.Getenv("SUPABASE_SERVICE_ROLE"); v != "" {
-		cfg.SupabaseServiceRole = v
-	} else if cfg.SupabaseServiceRole == "" {
-		cfg.SupabaseServiceRole = fileServiceRole
-	}
-	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
-		cfg.OpenAIAPIKey = v
-	} else if cfg.OpenAIAPIKey == "" {
-		cfg.OpenAIAPIKey = fileOpenAI
-	}
+	cfg.SupabaseURL = strings.TrimSpace(os.Getenv("SUPABASE_URL"))
+	cfg.SupabaseServiceRole = firstNonEmptyEnv("SUPABASE_SERVICE_ROLE", "SUPABASE_SERVICE_ROLE_KEY")
+	cfg.OpenAIAPIKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 	if cfg.PreferredModel == "" {
 		cfg.PreferredModel = "gpt-5-mini"
 	}
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func getConfig() RuntimeConfig { cfgMu.RLock(); defer cfgMu.RUnlock(); return cfg }
@@ -860,13 +848,6 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
-}
-func readText(path string) string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(b))
 }
 func getenv(k, d string) string {
 	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
