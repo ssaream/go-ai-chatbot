@@ -84,7 +84,7 @@ func (o *OpenAIClient) Chat(system string, summary string, history []openAIChatM
 		model = "gpt-5-mini"
 	}
 	maxOutputTokens := getenvIntDefault("OPENAI_MAX_OUTPUT_TOKENS", 180)
-	verbosity := getenvDefault("OPENAI_VERBOSITY", "low")
+	verbosity := normalizeVerbosity(model, getenvDefault("OPENAI_VERBOSITY", "low"))
 
 	// Build Responses input messages (simple role+string content per docs)
 	input := make([]responsesInputMessage, 0, 2+len(history)+1)
@@ -154,7 +154,7 @@ func (o *OpenAIClient) Chat(system string, summary string, history []openAIChatM
 			MaxOutputTokens: 90,
 			Text: map[string]any{
 				"format":    map[string]any{"type": "text"},
-				"verbosity": "low",
+				"verbosity": normalizeVerbosity(model, "low"),
 			},
 		}
 		rewritten, rewriteErr := o.createResponse(rewriteReq)
@@ -232,7 +232,7 @@ func (o *OpenAIClient) createResponseWithRetry(reqBody responsesCreateRequest, a
 				retryReq.Text = map[string]any{}
 			}
 			retryReq.Text["format"] = map[string]any{"type": "text"}
-			retryReq.Text["verbosity"] = "low"
+			retryReq.Text["verbosity"] = normalizeVerbosity(retryReq.Model, "low")
 			return o.createResponseWithRetry(retryReq, attempt+1)
 		}
 		if reason == "content_filter" {
@@ -322,8 +322,9 @@ func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText stri
 	if strings.TrimSpace(userText) == "" {
 		return map[string]string{}, nil
 	}
+	factsModel := "gpt-4.1-mini"
 	reqBody := responsesCreateRequest{
-		Model:        "gpt-4.1-mini",
+		Model:        factsModel,
 		Instructions: "Extract only fields for CRM storage. Return JSON object only with keys: order_id,email,phone,name,item,reason. Use empty string when unknown.",
 		Input: []responsesInputMessage{{
 			Role:    "user",
@@ -333,7 +334,7 @@ func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText stri
 		MaxOutputTokens: 140,
 		Text: map[string]any{
 			"format":    map[string]any{"type": "text"},
-			"verbosity": "low",
+			"verbosity": normalizeVerbosity(factsModel, "low"),
 		},
 	}
 	reply, err := o.createResponse(reqBody)
@@ -341,6 +342,25 @@ func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText stri
 		return nil, err
 	}
 	return parseFactsJSON(reply), nil
+}
+
+func normalizeVerbosity(model, requested string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if requested == "" {
+		requested = "low"
+	}
+
+	if model == "gpt-4.1-mini" {
+		return "medium"
+	}
+
+	switch requested {
+	case "low", "medium", "high":
+		return requested
+	default:
+		return "low"
+	}
 }
 
 func extractResponseTextFallback(raw []byte) string {
