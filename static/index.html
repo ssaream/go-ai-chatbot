@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>AI Chatbot MVP</title>
+  <style>
+    body { font-family: system-ui, Arial; max-width: 900px; margin: 24px auto; padding: 0 12px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    #log { height: 520px; overflow: auto; border: 1px solid #eee; border-radius: 12px; padding: 12px; background: #fafafa; }
+    .msg { margin: 10px 0; padding: 10px 12px; border-radius: 12px; max-width: 85%; white-space: pre-wrap; }
+    .user { background: #e8f0fe; margin-left: auto; }
+    .bot  { background: #fff; border: 1px solid #eee; }
+    .row { display: flex; gap: 10px; margin-top: 12px; }
+    .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field.full { grid-column: 1 / -1; }
+    .field label { font-size: 12px; color: #555; }
+    .field input { border: 1px solid #ddd; border-radius: 10px; padding: 10px; }
+    textarea { flex: 1; resize: vertical; min-height: 44px; border-radius: 10px; padding: 10px; border: 1px solid #ddd; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ddd; background: #111; color: #fff; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .meta { display:flex; justify-content: space-between; align-items:center; margin-bottom: 10px; color:#555; font-size: 13px;}
+    code { background: #f2f2f2; padding: 2px 6px; border-radius: 6px; }
+    .hint { font-size: 12px; color: #666; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <h2>AI Chatbot MVP</h2>
+  <div class="card">
+    <div class="meta">
+      <div>Session (cookie): <code id="sid">...</code></div>
+      <div><button id="new">New session</button></div>
+    </div>
+
+    <div class="config-grid">
+      <div class="field full">
+        <label for="supabaseUrl">Supabase URL</label>
+        <input id="supabaseUrl" type="text" placeholder="https://your-project.supabase.co" autocomplete="off"/>
+      </div>
+      <div class="field">
+        <label for="supabaseKey">Supabase Service Role Key</label>
+        <input id="supabaseKey" type="password" placeholder="service_role key" autocomplete="off"/>
+      </div>
+      <div class="field">
+        <label for="openaiKey">OpenAI API Key</label>
+        <input id="openaiKey" type="password" placeholder="sk-..." autocomplete="off"/>
+      </div>
+    </div>
+    <div class="hint">Saved in this browser using localStorage. Leave blank to use server env vars.</div>
+
+
+    <div class="field">
+      <label for="model">OpenAI Model</label>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <select id="model" style="flex:1; padding:10px 12px; border:1px solid #ddd; border-radius:10px;"></select>
+        <button id="refreshModels" type="button" title="Refresh model list">↻</button>
+      </div>
+      <div class="hint" style="margin-top:6px;">If the list is empty, your API key may not be set (client-side) or the server env key is missing.</div>
+    </div>
+
+    <div id="log"></div>
+
+    <div class="row">
+      <textarea id="input" placeholder="Type your message... (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="send">Send</button>
+    </div>
+  </div>
+
+<script>
+  const STORAGE_KEYS = {
+    supabaseUrl: "chatbot.supabaseUrl",
+    supabaseKey: "chatbot.supabaseServiceRoleKey",
+    openaiKey: "chatbot.openaiApiKey",
+    model: "chatbot.openaiModel",
+  };
+
+  const log = document.getElementById("log");
+  const input = document.getElementById("input");
+  const sendBtn = document.getElementById("send");
+  const modelSel = document.getElementById("model");
+  const refreshModelsBtn = document.getElementById("refreshModels");
+  const sidEl = document.getElementById("sid");
+  const newBtn = document.getElementById("new");
+  const supabaseUrlInput = document.getElementById("supabaseUrl");
+  const supabaseKeyInput = document.getElementById("supabaseKey");
+  const openaiKeyInput = document.getElementById("openaiKey");
+
+  function addMsg(text, who) {
+    const div = document.createElement("div");
+    div.className = `msg ${who}`;
+    div.textContent = text;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function saveConfig() {
+    localStorage.setItem(STORAGE_KEYS.supabaseUrl, supabaseUrlInput.value.trim());
+    localStorage.setItem(STORAGE_KEYS.supabaseKey, supabaseKeyInput.value.trim());
+    localStorage.setItem(STORAGE_KEYS.openaiKey, openaiKeyInput.value.trim());
+    localStorage.setItem(STORAGE_KEYS.model, modelSel.value);
+  }
+
+  function loadConfig() {
+    supabaseUrlInput.value = localStorage.getItem(STORAGE_KEYS.supabaseUrl) || "";
+    supabaseKeyInput.value = localStorage.getItem(STORAGE_KEYS.supabaseKey) || "";
+    openaiKeyInput.value = localStorage.getItem(STORAGE_KEYS.openaiKey) || "";
+    // model will be set after we load models
+
+  }
+
+  function buildConfigHeaders() {
+    const headers = {};
+    const supabaseURL = supabaseUrlInput.value.trim();
+    const supabaseKey = supabaseKeyInput.value.trim();
+    const openAIKey = openaiKeyInput.value.trim();
+
+    if (supabaseURL) headers["X-Supabase-Url"] = supabaseURL;
+    if (supabaseKey) headers["X-Supabase-Service-Role-Key"] = supabaseKey;
+    if (openAIKey) headers["X-OpenAI-Api-Key"] = openAIKey;
+
+    return headers;
+  }
+
+  async function loadModels() {
+    // Populate with a minimal fallback first (in case /models fails)
+    const fallback = ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini", "o3", "o4-mini"];
+    const saved = localStorage.getItem(STORAGE_KEYS.model) || "";
+    function setOptions(list) {
+      modelSel.innerHTML = "";
+      for (const id of list) {
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = id;
+        modelSel.appendChild(opt);
+      }
+      if (saved && [...modelSel.options].some(o => o.value === saved)) {
+        modelSel.value = saved;
+      } else if (modelSel.options.length) {
+        modelSel.selectedIndex = 0;
+      }
+    }
+    setOptions(fallback);
+
+    try {
+      const headers = buildConfigHeaders();
+      const resp = await fetch("/models", { headers });
+      const j = await resp.json();
+      if (!resp.ok) throw new Error(j.error || "failed to load models");
+      if (Array.isArray(j.models) && j.models.length) {
+        setOptions(j.models);
+      }
+    } catch (e) {
+      // keep fallback
+      console.warn("Model list load failed:", e);
+    }
+  }
+
+  async function whoAmI() {
+    const resp = await fetch("/whoami", { method: "GET" });
+    const data = await resp.json();
+    sidEl.textContent = data.session_id || "unknown";
+  }
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text) return;
+
+    saveConfig();
+
+    addMsg(text, "user");
+    input.value = "";
+    sendBtn.disabled = true;
+
+    try {
+      const resp = await fetch("/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...buildConfigHeaders(),
+        },
+        body: JSON.stringify({ message: text, channel: "web", locale: "en-IN", model: modelSel.value })
+      });
+
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "Request failed");
+      addMsg(data.reply, "bot");
+    } catch (e) {
+      addMsg("Error: " + e.message, "bot");
+    } finally {
+      sendBtn.disabled = false;
+      input.focus();
+      await whoAmI();
+    }
+  }
+
+  sendBtn.addEventListener("click", send);
+
+  [supabaseUrlInput, supabaseKeyInput, openaiKeyInput].forEach((el) => {
+    el.addEventListener("input", saveConfig);
+  });
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+
+  newBtn.addEventListener("click", async () => {
+    await fetch("/new-session", { method: "POST" });
+    log.innerHTML = "";
+    addMsg("New session started. How can I help you today?", "bot");
+    await whoAmI();
+  });
+
+  (async function init() {
+    loadConfig();
+    await loadModels();
+    refreshModelsBtn.addEventListener("click", async () => { await loadModels(); saveConfig(); });
+    modelSel.addEventListener("change", saveConfig);
+    await whoAmI();
+    addMsg("Hi! How can I help you today?", "bot");
+  })();
+</script>
+</body>
+</html>
