@@ -1,0 +1,5 @@
+.env
+*.local
+ai_api.txt
+supabase_url.txt
+service_role.txt

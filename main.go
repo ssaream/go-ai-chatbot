@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -67,7 +68,9 @@ type CloseConversationIn struct {
 }
 
 func main() {
-	loadSecretsFromFiles()
+	// Load .env for local development (no-op if file does not exist).
+	loadDotEnvFile(".env")
+	loadSecretsFromEnv()
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir("static")))
 	mux.HandleFunc("/health", healthHandler)
@@ -721,7 +724,7 @@ func addSBHeaders(req *http.Request, key, prefer string) {
 }
 
 func requireOpenAIKey() (string, error) {
-	loadSecretsFromFiles()
+	loadSecretsFromEnv()
 	k := getConfig().OpenAIAPIKey
 	if k == "" {
 		return "", errors.New("Missing OpenAI API key. Set OPENAI_API_KEY.")
@@ -730,7 +733,7 @@ func requireOpenAIKey() (string, error) {
 }
 
 func requireSupabase() (string, string, error) {
-	loadSecretsFromFiles()
+	loadSecretsFromEnv()
 	c := getConfig()
 	if strings.TrimSpace(c.SupabaseURL) == "" || strings.TrimSpace(c.SupabaseServiceRole) == "" {
 		return "", "", errors.New("Missing Supabase URL or service_role key. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE (or SUPABASE_SERVICE_ROLE_KEY).")
@@ -738,7 +741,7 @@ func requireSupabase() (string, string, error) {
 	return strings.TrimRight(c.SupabaseURL, "/"), c.SupabaseServiceRole, nil
 }
 
-func loadSecretsFromFiles() {
+func loadSecretsFromEnv() {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	cfg.SupabaseURL = strings.TrimSpace(os.Getenv("SUPABASE_URL"))
@@ -746,6 +749,38 @@ func loadSecretsFromFiles() {
 	cfg.OpenAIAPIKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 	if cfg.PreferredModel == "" {
 		cfg.PreferredModel = "gpt-5-mini"
+	}
+}
+
+func loadDotEnvFile(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		val := strings.TrimSpace(v)
+		val = strings.Trim(val, `"'`)
+		if _, exists := os.LookupEnv(key); !exists {
+			_ = os.Setenv(key, val)
+		}
 	}
 }
 
@@ -761,14 +796,12 @@ func firstNonEmptyEnv(keys ...string) string {
 func getConfig() RuntimeConfig { cfgMu.RLock(); defer cfgMu.RUnlock(); return cfg }
 
 func maskConfig(c RuntimeConfig) map[string]any {
-	out := map[string]any{"supabase_url": c.SupabaseURL, "supabase_service_role": c.SupabaseServiceRole, "openai_api_key": c.OpenAIAPIKey, "preferred_model": c.PreferredModel}
-	if out["supabase_service_role"] != "" {
-		out["supabase_service_role"] = "****"
+	return map[string]any{
+		"preferred_model":           c.PreferredModel,
+		"has_openai_key":            strings.TrimSpace(c.OpenAIAPIKey) != "",
+		"has_supabase_url":          strings.TrimSpace(c.SupabaseURL) != "",
+		"has_supabase_service_role": strings.TrimSpace(c.SupabaseServiceRole) != "",
 	}
-	if out["openai_api_key"] != "" {
-		out["openai_api_key"] = "****"
-	}
-	return out
 }
 
 func getOrSetAnonID(w http.ResponseWriter, r *http.Request) string {
