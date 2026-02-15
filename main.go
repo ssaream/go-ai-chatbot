@@ -224,6 +224,14 @@ func (o *OpenAIClient) createResponseWithRetry(reqBody responsesCreateRequest, a
 
 	out, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
+		if attempt == 0 {
+			if retried, reply, retryErr := o.retryWithoutUnsupportedOptions(reqBody, out); retried {
+				if retryErr != nil {
+					return "", retryErr
+				}
+				return reply, nil
+			}
+		}
 		return "", fmt.Errorf("openai responses api error (%d): %s", resp.StatusCode, string(out))
 	}
 
@@ -272,6 +280,35 @@ func (o *OpenAIClient) createResponseWithRetry(reqBody responsesCreateRequest, a
 	}
 
 	return "", fmt.Errorf("openai: no text found in response (status=%s)", parsed.Status)
+}
+
+func (o *OpenAIClient) retryWithoutUnsupportedOptions(reqBody responsesCreateRequest, responseBody []byte) (bool, string, error) {
+	body := strings.ToLower(string(responseBody))
+	if !strings.Contains(body, "verbosity") {
+		return false, "", nil
+	}
+	if reqBody.Text == nil {
+		return false, "", nil
+	}
+	if _, exists := reqBody.Text["verbosity"]; !exists {
+		return false, "", nil
+	}
+
+	retryReq := reqBody
+	retryText := map[string]any{}
+	for k, v := range reqBody.Text {
+		if k == "verbosity" {
+			continue
+		}
+		retryText[k] = v
+	}
+	retryReq.Text = retryText
+
+	reply, err := o.createResponseWithRetry(retryReq, 1)
+	if err != nil {
+		return true, "", err
+	}
+	return true, reply, nil
 }
 
 func extractParsedResponseText(parsed responsesCreateResponse) string {
