@@ -220,6 +220,73 @@ func (sb *SupabaseClient) GetOrCreateOpenConversation(userID, anonymousID, chann
 	return convs[0], nil
 }
 
+func (sb *SupabaseClient) GetOpenConversationByAnonymousID(anonymousID string) (Conversation, bool, error) {
+	user, found, err := sb.GetAppUserByAnonymousID(anonymousID)
+	if err != nil {
+		return Conversation{}, false, err
+	}
+	if !found {
+		return Conversation{}, false, nil
+	}
+	out, code, err := sb.do("GET", "/rest/v1/conversations", map[string]string{
+		"user_id": "eq." + user.ID,
+		"status":  "eq.open",
+		"select":  "id,user_id,status,summary,last_intent,channel,locale,metadata",
+		"order":   "updated_at.desc",
+		"limit":   "1",
+	}, "", nil)
+	if err != nil {
+		return Conversation{}, false, err
+	}
+	if code >= 300 {
+		return Conversation{}, false, fmt.Errorf("supabase select conversations (%d): %s", code, string(out))
+	}
+	var convs []Conversation
+	_ = json.Unmarshal(out, &convs)
+	if len(convs) == 0 {
+		return Conversation{}, false, nil
+	}
+	return convs[0], true, nil
+}
+
+func (sb *SupabaseClient) CloseOpenConversationsByAnonymousID(anonymousID string) error {
+	user, found, err := sb.GetAppUserByAnonymousID(anonymousID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	patch := map[string]any{
+		"status": "closed",
+	}
+	out, code, err := sb.do("PATCH", "/rest/v1/conversations", map[string]string{
+		"user_id": "eq." + user.ID,
+		"status":  "eq.open",
+	}, "", patch)
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return fmt.Errorf("supabase close conversations (%d): %s", code, string(out))
+	}
+	return nil
+}
+
+func (sb *SupabaseClient) Ping() error {
+	_, code, err := sb.do("GET", "/rest/v1/app_users", map[string]string{
+		"select": "id",
+		"limit":  "1",
+	}, "", nil)
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return fmt.Errorf("supabase ping failed (%d)", code)
+	}
+	return nil
+}
+
 func (sb *SupabaseClient) FetchRecentMessages(conversationID string, limit int) ([]MessageRow, error) {
 	out, code, err := sb.do("GET", "/rest/v1/messages", map[string]string{
 		"conversation_id": "eq." + conversationID,

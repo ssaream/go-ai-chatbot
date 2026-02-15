@@ -25,8 +25,9 @@ type Inbound struct {
 }
 
 type RouteResult struct {
-	Intent Intent
-	Reply  string
+	Intent         Intent
+	Reply          string
+	ConversationID string
 }
 
 func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
@@ -38,7 +39,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 			return RouteResult{}, err
 		}
 		if already {
-			return RouteResult{Intent: IntentOther, Reply: "✅ Got it. (Duplicate message ignored.)"}, nil
+			return RouteResult{Intent: IntentOther, Reply: "✅ Got it. (Duplicate message ignored.)", ConversationID: ""}, nil
 		}
 	}
 
@@ -58,7 +59,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 
 	if interruptReply != "" {
 		_ = rt.SB.InsertMessage(conv.ID, "assistant", interruptReply, map[string]any{"intent": "identity_interrupt"})
-		return RouteResult{Intent: IntentOther, Reply: interruptReply}, nil
+		return RouteResult{Intent: IntentOther, Reply: interruptReply, ConversationID: conv.ID}, nil
 	}
 
 	// 3) load memory
@@ -68,7 +69,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 	}
 
 	// 4) extract facts (order_id/email/phone/name/item/reason)
-	facts := rt.extractFacts(in)
+	facts := rt.extractFacts(ctx, in)
 
 	// 5) classify intent (fast heuristic; LLM can refine later)
 	intent := classifyIntent(in.UserText)
@@ -93,7 +94,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 	if len(missing) > 0 {
 		reply := rt.askForMissing(spec, missing)
 		_ = rt.persistAssistant(conv, intent, reply, convFacts)
-		return RouteResult{Intent: intent, Reply: reply}, nil
+		return RouteResult{Intent: intent, Reply: reply, ConversationID: conv.ID}, nil
 	}
 
 	// 8) tool plan (safe + minimal)
@@ -104,7 +105,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 	}
 
 	_ = rt.persistAssistant(conv, intent, reply, convFacts)
-	return RouteResult{Intent: intent, Reply: reply}, nil
+	return RouteResult{Intent: intent, Reply: reply, ConversationID: conv.ID}, nil
 }
 
 func (rt *Router) executeToolsIfNeeded(
@@ -191,10 +192,10 @@ func (rt *Router) executeToolsIfNeeded(
 func (rt *Router) llmReply(intent Intent, summary string, recent []MessageRow, userText string, facts map[string]string) string {
 	system := "You are an ecommerce assistant. Be concise and helpful. " +
 		"Never invent order status, delivery dates, refunds, or policies. " +
-		"Answer in 1–4 short bullets. Max 1 question. " +
+		"Keep every reply to 1-2 short sentences. " +
+		"Ask at most one clarifying question at a time. " +
 		"No preamble, no disclaimers, no repetition. " +
-		"If info missing, ask only the single most important missing field." +
-		"If identifiers are missing, ask for them."
+		"If info is missing, ask only the single most important missing field."
 
 	h := make([]openAIChatMsg, 0, len(recent))
 	for _, m := range recent {
@@ -305,7 +306,7 @@ var (
 	reOrder = regexp.MustCompile(`(?i)\b(order\s*#?\s*|ord\s*#?\s*)([A-Z0-9\-]{4,})\b`)
 )
 
-func (rt *Router) extractFacts(in Inbound) map[string]string {
+func (rt *Router) extractFacts(ctx context.Context, in Inbound) map[string]string {
 	f := map[string]string{}
 
 	// WhatsApp provides a stable phone
@@ -313,26 +314,38 @@ func (rt *Router) extractFacts(in Inbound) map[string]string {
 		f["phone"] = normalizePhone(in.WhatsAppFrom)
 	}
 
-	// email
+	// regex fallback extraction
 	if m := reEmail.FindString(in.UserText); m != "" {
 		f["email"] = strings.ToLower(m)
 	}
-	// phone
 	if m := rePhone.FindString(in.UserText); m != "" && f["phone"] == "" {
 		f["phone"] = normalizePhone(m)
 	}
-	// order id
 	if m := reOrder.FindStringSubmatch(in.UserText); len(m) >= 3 {
 		f["order_id"] = strings.TrimSpace(m[2])
 	}
 
-	// naive “my name is …”
 	lt := strings.ToLower(in.UserText)
 	if strings.Contains(lt, "my name is") {
 		idx := strings.Index(lt, "my name is")
 		name := strings.TrimSpace(in.UserText[idx+len("my name is"):])
 		if len(name) > 0 && len(name) < 60 {
 			f["name"] = name
+		}
+	}
+
+	// LLM extraction is forced to gpt-4.1-mini for stable schema extraction.
+	if rt.LLM != nil {
+		extracted, err := rt.LLM.ExtractFactsForStorage(ctx, in.UserText)
+		if err != nil {
+			log.Println("fact extraction error:", err)
+		} else {
+			for k, v := range extracted {
+				v = strings.TrimSpace(v)
+				if v != "" {
+					f[k] = v
+				}
+			}
 		}
 	}
 
