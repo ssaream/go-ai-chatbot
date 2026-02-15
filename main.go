@@ -49,35 +49,42 @@ type responsesCreateRequest struct {
 }
 
 var extractionJSONSchema = map[string]any{
-	"name": "supabase_extraction",
+	"name": "extracted_fields",
 	"schema": map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
 		"properties": map[string]any{
-			"app_user": map[string]any{
+			"name":     map[string]any{"type": []any{"string", "null"}},
+			"email":    map[string]any{"type": []any{"string", "null"}},
+			"phone":    map[string]any{"type": []any{"string", "null"}},
+			"order_id": map[string]any{"type": []any{"string", "null"}},
+			"address":  map[string]any{"type": []any{"string", "null"}},
+			"address_components": map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
 				"properties": map[string]any{
-					"name":  map[string]any{"type": "string", "maxLength": 120},
-					"email": map[string]any{"type": "string", "maxLength": 320},
-					"phone": map[string]any{"type": "string", "maxLength": 40},
+					"line1":       map[string]any{"type": []any{"string", "null"}},
+					"line2":       map[string]any{"type": []any{"string", "null"}},
+					"city":        map[string]any{"type": []any{"string", "null"}},
+					"state":       map[string]any{"type": []any{"string", "null"}},
+					"postal_code": map[string]any{"type": []any{"string", "null"}},
+					"country":     map[string]any{"type": []any{"string", "null"}},
 				},
-				"required": []string{"name", "email", "phone"},
+				"required": []string{"line1", "line2", "city", "state", "postal_code", "country"},
 			},
-			"conversation_facts": map[string]any{
-				"type":                 "object",
-				"additionalProperties": false,
-				"properties": map[string]any{
-					"order_id": map[string]any{"type": "string", "maxLength": 80},
-					"item":     map[string]any{"type": "string", "maxLength": 160},
-					"reason":   map[string]any{"type": "string", "maxLength": 240},
-				},
-				"required": []string{"order_id", "item", "reason"},
+			"intent": map[string]any{
+				"type": "string",
+				"enum": []string{"product_or_content", "order_support", "returns_refunds", "shipping_delivery", "account_support", "handoff_human", "other"},
 			},
+			"confidence":         map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
+			"needs_verification": map[string]any{"type": "boolean"},
+			"notes":              map[string]any{"type": []any{"string", "null"}},
 		},
-		"required": []string{"app_user", "conversation_facts"},
+		"required": []string{"name", "email", "phone", "order_id", "address", "address_components", "intent", "confidence", "needs_verification", "notes"},
 	},
 }
+
+const extractorModelDefault = "gpt-4o-mini"
 
 type responsesCreateResponse struct {
 	ID                string `json:"id"`
@@ -360,50 +367,52 @@ func extractTextValue(v any) string {
 }
 
 func parseFactsJSON(raw string) map[string]string {
-	out := map[string]string{}
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return out
-	}
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start >= 0 && end > start {
-		raw = raw[start : end+1]
-	}
-	var data map[string]any
+	data := map[string]any{}
 	if err := json.Unmarshal([]byte(raw), &data); err != nil {
-		return out
+		return map[string]string{}
 	}
-	if appUser, ok := data["app_user"].(map[string]any); ok {
-		for _, key := range []string{"name", "email", "phone"} {
-			if v, ok := appUser[key].(string); ok {
-				v = strings.TrimSpace(v)
-				if v != "" {
-					out[key] = v
-				}
-			}
-		}
-	}
-	if convFacts, ok := data["conversation_facts"].(map[string]any); ok {
-		for _, key := range []string{"order_id", "item", "reason"} {
-			if v, ok := convFacts[key].(string); ok {
-				v = strings.TrimSpace(v)
-				if v != "" {
-					out[key] = v
-				}
-			}
-		}
-	}
-	for _, key := range []string{"order_id", "email", "phone", "name", "item", "reason"} {
-		if _, exists := out[key]; exists {
+	out := map[string]string{}
+	for _, key := range []string{"name", "email", "phone", "order_id", "address", "intent", "notes"} {
+		v, ok := data[key]
+		if !ok || v == nil {
 			continue
 		}
-		if v, ok := data[key].(string); ok {
-			v = strings.TrimSpace(v)
-			if v != "" {
-				out[key] = v
+		if s, ok := v.(string); ok {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				out[key] = s
 			}
 		}
+	}
+	if ac, ok := data["address_components"].(map[string]any); ok {
+		for _, key := range []string{"line1", "line2", "city", "state", "postal_code", "country"} {
+			v, ok := ac[key]
+			if !ok || v == nil {
+				continue
+			}
+			if sv, ok := v.(string); ok {
+				sv = strings.TrimSpace(sv)
+				if sv != "" {
+					out["address_"+key] = sv
+				}
+			}
+		}
+	}
+	if v, ok := data["confidence"].(float64); ok {
+		out["confidence"] = strconv.Itoa(int(v))
+	}
+	if v, ok := data["needs_verification"].(bool); ok {
+		if v {
+			out["needs_verification"] = "true"
+		} else {
+			out["needs_verification"] = "false"
+		}
+	}
+	if out["email"] != "" {
+		out["email"] = normalizeEmail(out["email"])
+	}
+	if out["phone"] != "" {
+		out["phone"] = normalizePhone(out["phone"])
 	}
 	return out
 }
@@ -413,10 +422,10 @@ func (o *OpenAIClient) ExtractFactsForStorage(ctx context.Context, userText stri
 	if strings.TrimSpace(userText) == "" {
 		return map[string]string{}, nil
 	}
-	factsModel := "gpt-4.1-mini"
+	factsModel := extractorModelDefault
 	reqBody := responsesCreateRequest{
 		Model:        factsModel,
-		Instructions: "Extract user + conversation facts for Supabase storage. Output JSON only, matching the provided schema. Use empty strings for unknown scalar values.",
+		Instructions: "You are an information extraction engine for an ecommerce chatbot. Extract only what the user explicitly provided and return JSON matching the schema. Use null for missing values. Normalize email to lowercase. Normalize phone to digits only and preserve a leading + if provided.",
 		Input: []responsesInputMessage{{
 			Role:    "user",
 			Content: userText,
@@ -447,7 +456,7 @@ func normalizeVerbosity(model, requested string) string {
 		requested = "low"
 	}
 
-	if model == "gpt-4.1-mini" {
+	if model == "gpt-4.1-mini" || model == "gpt-4o-mini" {
 		return "medium"
 	}
 
@@ -592,7 +601,7 @@ func chatOutputSchemaForModel(model string) map[string]any {
 
 func extractionOutputSchemaInfo() map[string]any {
 	return map[string]any{
-		"model": "gpt-4.1-mini",
+		"model": extractorModelDefault,
 		"format": map[string]any{
 			"type":   "json_schema",
 			"name":   extractionJSONSchema["name"],
@@ -915,7 +924,9 @@ func main() {
 			"cookie_id":                sid,
 			"conversation_id":          out.ConversationID,
 			"chat_model":               effectiveRouter.LLM.Model,
-			"extraction_model":         "gpt-4.1-mini",
+			"extracted":                out.Extracted,
+			"extractor_model":          extractorModelDefault,
+			"extractor_error":          out.ExtractorError,
 			"chat_output_schema":       chatOutputSchemaForModel(effectiveRouter.LLM.Model),
 			"extraction_output_schema": extractionOutputSchemaInfo(),
 		})

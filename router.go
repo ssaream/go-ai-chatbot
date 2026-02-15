@@ -28,6 +28,8 @@ type RouteResult struct {
 	Intent         Intent
 	Reply          string
 	ConversationID string
+	Extracted      map[string]string
+	ExtractorError string
 }
 
 func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
@@ -39,12 +41,11 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 			return RouteResult{}, err
 		}
 		if already {
-			return RouteResult{Intent: IntentOther, Reply: "✅ Got it. (Duplicate message ignored.)", ConversationID: ""}, nil
+			return RouteResult{Intent: IntentOther, Reply: "✅ Got it. (Duplicate message ignored.)", ConversationID: "", Extracted: map[string]string{}}, nil
 		}
 	}
 
 	// 1) upsert user + conversation
-	user, err := rt.SB.UpsertUserByAnonymousID(in.SessionID, in.Channel)
 	user, interruptReply, err := rt.SB.ResolveIdentity(ctx, in)
 	if err != nil {
 		return RouteResult{}, err
@@ -59,7 +60,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 
 	if interruptReply != "" {
 		_ = rt.SB.InsertMessage(conv.ID, "assistant", interruptReply, map[string]any{"intent": "identity_interrupt"})
-		return RouteResult{Intent: IntentOther, Reply: interruptReply, ConversationID: conv.ID}, nil
+		return RouteResult{Intent: IntentOther, Reply: interruptReply, ConversationID: conv.ID, Extracted: map[string]string{}}, nil
 	}
 
 	// 3) load memory
@@ -69,7 +70,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 	}
 
 	// 4) extract facts (order_id/email/phone/name/item/reason)
-	facts := rt.extractFacts(ctx, in)
+	facts, extractorErr := rt.extractFacts(ctx, in)
 
 	// 5) classify intent (fast heuristic; LLM can refine later)
 	intent := classifyIntent(in.UserText)
@@ -94,7 +95,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 	if len(missing) > 0 {
 		reply := rt.askForMissing(spec, missing)
 		_ = rt.persistAssistant(conv, intent, reply, convFacts)
-		return RouteResult{Intent: intent, Reply: reply, ConversationID: conv.ID}, nil
+		return RouteResult{Intent: intent, Reply: reply, ConversationID: conv.ID, Extracted: facts, ExtractorError: extractorErr}, nil
 	}
 
 	// 8) tool plan (safe + minimal)
@@ -105,7 +106,7 @@ func (rt *Router) Handle(ctx context.Context, in Inbound) (RouteResult, error) {
 	}
 
 	_ = rt.persistAssistant(conv, intent, reply, convFacts)
-	return RouteResult{Intent: intent, Reply: reply, ConversationID: conv.ID}, nil
+	return RouteResult{Intent: intent, Reply: reply, ConversationID: conv.ID, Extracted: facts, ExtractorError: extractorErr}, nil
 }
 
 func (rt *Router) executeToolsIfNeeded(
@@ -306,8 +307,9 @@ var (
 	reOrder = regexp.MustCompile(`(?i)\b(order\s*#?\s*|ord\s*#?\s*)([A-Z0-9\-]{4,})\b`)
 )
 
-func (rt *Router) extractFacts(ctx context.Context, in Inbound) map[string]string {
+func (rt *Router) extractFacts(ctx context.Context, in Inbound) (map[string]string, string) {
 	f := map[string]string{}
+	extractorErr := ""
 
 	// WhatsApp provides a stable phone
 	if in.WhatsAppFrom != "" {
@@ -316,7 +318,7 @@ func (rt *Router) extractFacts(ctx context.Context, in Inbound) map[string]strin
 
 	// regex fallback extraction
 	if m := reEmail.FindString(in.UserText); m != "" {
-		f["email"] = strings.ToLower(m)
+		f["email"] = normalizeEmail(m)
 	}
 	if m := rePhone.FindString(in.UserText); m != "" && f["phone"] == "" {
 		f["phone"] = normalizePhone(m)
@@ -334,11 +336,12 @@ func (rt *Router) extractFacts(ctx context.Context, in Inbound) map[string]strin
 		}
 	}
 
-	// LLM extraction is forced to gpt-4.1-mini for stable schema extraction.
+	// LLM extraction is forced to gpt-4o-mini for stable schema extraction.
 	if rt.LLM != nil {
 		extracted, err := rt.LLM.ExtractFactsForStorage(ctx, in.UserText)
 		if err != nil {
 			log.Println("fact extraction error:", err)
+			extractorErr = err.Error()
 		} else {
 			for k, v := range extracted {
 				v = strings.TrimSpace(v)
@@ -349,7 +352,7 @@ func (rt *Router) extractFacts(ctx context.Context, in Inbound) map[string]strin
 		}
 	}
 
-	return f
+	return f, extractorErr
 }
 
 func missingFields(spec IntentSpec, facts map[string]string, in Inbound) []Field {
