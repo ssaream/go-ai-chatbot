@@ -336,7 +336,7 @@ func (rt *Router) extractFacts(ctx context.Context, in Inbound) (map[string]stri
 		}
 	}
 
-	// LLM extraction is forced to gpt-4o-mini for stable schema extraction.
+	// LLM extraction is forced to gpt-4.1-mini for stable schema extraction.
 	if rt.LLM != nil {
 		extracted, err := rt.LLM.ExtractFactsForStorage(ctx, in.UserText)
 		if err != nil {
