@@ -113,10 +113,34 @@ const backendStatus = document.getElementById("backendStatus");
 const aiStatus = document.getElementById("aiStatus");
 const supabaseStatus = document.getElementById("supabaseStatus");
 
-function logEvent(msg) {
+const CHAT_ROLES = new Set(["user", "assistant"]);
+
+function clearChat() {
+  chatLog.innerHTML = "";
+}
+
+function normalizeRole(role) {
+  if (role === "assistant") return "bot";
+  if (role === "user") return "user";
+  return "bot";
+}
+
+function logEvent(entry) {
   const line = document.createElement("div");
   line.className = "line";
-  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  const ts = `[${new Date().toLocaleTimeString()}]`;
+
+  if (typeof entry === "string") {
+    line.textContent = `${ts} ${entry}`;
+    eventLog.prepend(line);
+    return;
+  }
+
+  const status = entry?.status || "info";
+  const title = entry?.title || "event";
+  const inputText = entry?.input || "-";
+  const outputText = entry?.output || "-";
+  line.textContent = `${ts} [${status.toUpperCase()}] ${title} | input: ${inputText} | output: ${outputText}`;
   eventLog.prepend(line);
 }
 
@@ -161,12 +185,12 @@ async function refreshStatus() {
     setStatus(backendStatus, "Backend", !!j.backend?.connected);
     setStatus(aiStatus, "AI", !!j.ai?.connected, j.ai?.error || "");
     setStatus(supabaseStatus, "Supabase", !!j.supabase?.connected, j.supabase?.error || "");
-    logEvent("Status checked");
+    logEvent({ status: "ok", title: "status check", input: "connectivity", output: `backend=${!!j.backend?.connected}, ai=${!!j.ai?.connected}, supabase=${!!j.supabase?.connected}` });
   } catch (e) {
     setStatus(backendStatus, "Backend", false, e.message);
     setStatus(aiStatus, "AI", false, "status unavailable");
     setStatus(supabaseStatus, "Supabase", false, "status unavailable");
-    logEvent(`Status check failed: ${e.message}`);
+    logEvent({ status: "error", title: "status check", input: "connectivity", output: e.message });
   }
 }
 
@@ -213,6 +237,39 @@ async function whoAmI() {
   convEl.textContent = data.conversation_id || "none";
 }
 
+async function hydrateRecentMessages() {
+  const statusConnected = supabaseStatus.classList.contains("ok");
+  if (!statusConnected) {
+    logEvent({ status: "warn", title: "hydrate skipped", input: "supabase disconnected", output: "no history loaded" });
+    return;
+  }
+
+  try {
+    const resp = await fetch("/chat-history", { method: "GET", headers: buildConfigHeaders() });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "failed to load chat history");
+
+    const history = Array.isArray(data.messages) ? data.messages : [];
+    if (!history.length) {
+      logEvent({ status: "ok", title: "history hydrate", input: "last 5", output: "no previous messages" });
+      return;
+    }
+
+    clearChat();
+    for (const msg of history) {
+      if (!CHAT_ROLES.has(msg.role)) continue;
+      addMsg(msg.content || "", normalizeRole(msg.role));
+    }
+
+    if (data.session_id) sidEl.textContent = data.session_id;
+    if (data.conversation_id) convEl.textContent = data.conversation_id;
+
+    logEvent({ status: "ok", title: "history hydrate", input: "last 5", output: `loaded ${history.length} message(s)` });
+  } catch (e) {
+    logEvent({ status: "error", title: "history hydrate", input: "last 5", output: e.message });
+  }
+}
+
 async function send() {
   const text = input.value.trim();
   if (!text) return;
@@ -233,10 +290,11 @@ async function send() {
     sidEl.textContent = data.session_id || sidEl.textContent;
     cookieIdEl.textContent = data.cookie_id || cookieIdEl.textContent;
     convEl.textContent = data.conversation_id || convEl.textContent;
-    logEvent(`Chat response using model ${modelSel.value}`);
+    logEvent({ status: "ok", title: "chat response", input: text, output: data.reply, model: modelSel.value });
+    logEvent({ status: "ok", title: "model usage", input: `selected=${modelSel.value}`, output: `chat=${data.chat_model || modelSel.value}, extraction=${data.extraction_model || "gpt-4.1-mini"}` });
   } catch (e) {
     addMsg("Error: " + e.message, "bot");
-    logEvent(`Chat error: ${e.message}`);
+    logEvent({ status: "error", title: "chat response", input: text, output: e.message });
   } finally {
     sendBtn.disabled = false;
     input.focus();
@@ -251,7 +309,7 @@ sendBtn.addEventListener("click", send);
     await refreshStatus();
   });
 });
-modelSel.addEventListener("change", () => { saveConfig(); logEvent(`Model selected: ${modelSel.value}`); });
+modelSel.addEventListener("change", () => { saveConfig(); logEvent({ status: "info", title: "model selected", input: "dropdown", output: modelSel.value }); });
 refreshModelsBtn.addEventListener("click", async () => { await loadModels(); });
 
 input.addEventListener("keydown", (e) => {
@@ -287,8 +345,11 @@ newConversationBtn.addEventListener("click", async () => {
   await refreshStatus();
   await loadModels();
   await whoAmI();
-  addMsg("Hi! I can help with orders, returns, and product questions.", "bot");
-  logEvent("UI initialized");
+  await hydrateRecentMessages();
+  if (!chatLog.childElementCount) {
+    addMsg("Hi! I can help with orders, returns, and product questions.", "bot");
+  }
+  logEvent({ status: "ok", title: "ui initialized", input: "startup", output: "ready" });
 })();
 </script>
 </body>
